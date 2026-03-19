@@ -656,7 +656,8 @@ const state = {
   online: navigator.onLine,      // current connectivity
   tessWorker: null,              // Tesseract worker instance (created lazily)
   tessReady: false,              // true once Tesseract is initialised
-  tessLoading: false             // true while Tesseract is initialising
+  tessLoading: false,            // true while Tesseract is initialising
+  debugMode: false               // true = show preprocessed crop below thumbnails
 };
 
 
@@ -1103,86 +1104,389 @@ function stopCamera(n) {
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  CAPTURE FLOW
-//  Main action when the user taps a "Capture" button.
-//  1. Snapshot the live video onto a hidden canvas
-//  2. Freeze the camera preview
-//  3. Run recognition
-//  4. Advance to next step or show manual entry
+//  IMAGE PREPROCESSING
+//
+//  Raw camera frames often have glare, poor contrast, or uneven lighting
+//  that trips up both AI vision and Tesseract OCR.  We apply a lightweight
+//  pipeline to every captured image BEFORE sending it for recognition:
+//
+//    1. CROP     — extract only the viewfinder rectangle (80% × 45% centred)
+//                  so the AI sees a tight close-up, not the whole scene
+//    2. UPSCALE  — scale the crop up to at least 900 px wide so characters
+//                  are large enough for reliable OCR
+//    3. GREYSCALE — convert to greyscale; colour is irrelevant for text and
+//                  reduces JPEG compression artefacts on edges
+//    4. CONTRAST  — auto-levels stretch (min→0, max→255) + mild gamma to
+//                  separate dark text from light backgrounds and vice versa
+//    5. SHARPEN   — 3×3 unsharp-mask kernel to crisp up character edges
+//
+//  The ORIGINAL full-resolution colour image is still saved to the ZIP.
+//  Only the preprocessed crop is sent to the recognition engine.
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Capture a snapshot from the camera, run recognition, update UI.
+ * Crop the viewfinder region from a full video-resolution canvas.
+ * The viewfinder CSS overlay is 80% wide × 45% tall, centred.
+ * We use the same proportions here so the crop exactly matches what
+ * the user sees inside the brackets.
+ *
+ * The crop is also upscaled to a minimum width so OCR engines receive
+ * characters that are large enough to read reliably.
+ *
+ * @param {HTMLCanvasElement} srcCanvas - full-frame snapshot canvas
+ * @returns {HTMLCanvasElement} new canvas containing just the crop
+ */
+function cropToViewfinder(srcCanvas) {
+  const W = srcCanvas.width;
+  const H = srcCanvas.height;
+
+  // Match CSS viewfinder proportions: 80% wide, 45% tall, centred
+  const cropW = Math.round(W * 0.80);
+  const cropH = Math.round(H * 0.45);
+  const cropX = Math.round((W - cropW) / 2);
+  const cropY = Math.round((H - cropH) / 2);
+
+  // Upscale if the crop is narrower than MIN_WIDTH (common on low-res cameras)
+  const MIN_WIDTH = 900;
+  const scale     = cropW < MIN_WIDTH ? MIN_WIDTH / cropW : 1;
+  const outW      = Math.round(cropW * scale);
+  const outH      = Math.round(cropH * scale);
+
+  const out = document.createElement('canvas');
+  out.width  = outW;
+  out.height = outH;
+  const ctx  = out.getContext('2d');
+
+  // High-quality bicubic-style interpolation when upscaling
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(srcCanvas, cropX, cropY, cropW, cropH, 0, 0, outW, outH);
+  return out;
+}
+
+/**
+ * Convert a canvas to greyscale in-place using perceptual luminance weights.
+ * Greyscale:  eliminates colour cast that can fool contrast stretching,
+ *             reduces chroma noise, and makes subsequent operations faster.
+ * @param {HTMLCanvasElement} canvas - modified in-place
+ */
+function applyGreyscale(canvas) {
+  const ctx  = canvas.getContext('2d');
+  const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const px   = data.data;
+  for (let i = 0; i < px.length; i += 4) {
+    // ITU-R BT.601 luminance weights
+    const lum = px[i] * 0.299 + px[i+1] * 0.587 + px[i+2] * 0.114;
+    px[i] = px[i+1] = px[i+2] = lum;
+    // alpha unchanged
+  }
+  ctx.putImageData(data, 0, 0);
+}
+
+/**
+ * Auto-levels contrast stretch + mild gamma correction.
+ *
+ * Pass 1: find the actual min and max pixel values in the crop.
+ * Pass 2: remap so the darkest pixel → 0 and the brightest → 255,
+ *         then apply gamma = 0.85 (lifts midtones slightly, helps with
+ *         darker-than-expected industrial markings).
+ *
+ * Works on greyscale (R=G=B) images; calling on colour has no ill effect.
+ * @param {HTMLCanvasElement} canvas - modified in-place
+ */
+function applyContrast(canvas) {
+  const ctx  = canvas.getContext('2d');
+  const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const px   = data.data;
+
+  // Pass 1 — find dynamic range
+  let lo = 255, hi = 0;
+  for (let i = 0; i < px.length; i += 4) {
+    if (px[i] < lo) lo = px[i];
+    if (px[i] > hi) hi = px[i];
+  }
+  const range = (hi - lo) || 1; // guard against uniform image
+
+  // Pass 2 — stretch + gamma
+  const gamma = 0.85;
+  for (let i = 0; i < px.length; i += 4) {
+    let v   = (px[i] - lo) / range;           // normalise → [0, 1]
+    v       = Math.pow(v, gamma);              // gamma curve
+    const o = Math.min(255, Math.round(v * 255));
+    px[i] = px[i+1] = px[i+2] = o;
+  }
+  ctx.putImageData(data, 0, 0);
+}
+
+/**
+ * Apply a 3×3 unsharp-mask (sharpening) convolution.
+ *
+ * Kernel:   [ 0, -1,  0 ]
+ *           [-1,  5, -1 ]
+ *           [ 0, -1,  0 ]
+ *
+ * This emphasises character edges (vertical and horizontal strokes)
+ * without amplifying diagonal noise or specular highlights.
+ * Edge pixels (1-pixel border) are copied unmodified.
+ *
+ * @param {HTMLCanvasElement} canvas - modified in-place
+ */
+function applySharpen(canvas) {
+  const ctx = canvas.getContext('2d');
+  const W   = canvas.width;
+  const H   = canvas.height;
+  const src = ctx.getImageData(0, 0, W, H);
+  const dst = ctx.createImageData(W, H);
+  const s   = src.data;
+  const d   = dst.data;
+
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const i = (y * W + x) * 4;
+      for (let c = 0; c < 3; c++) {
+        // Centre weight 5, orthogonal neighbours −1
+        const val =
+            5 * s[i + c]
+          - 1 * s[i - W*4 + c]   // top
+          - 1 * s[i + W*4 + c]   // bottom
+          - 1 * s[i - 4   + c]   // left
+          - 1 * s[i + 4   + c];  // right
+        d[i + c] = Math.min(255, Math.max(0, val));
+      }
+      d[i + 3] = 255; // fully opaque
+    }
+  }
+  // Copy unprocessed border pixels from source
+  ctx.putImageData(dst, 0, 0);
+}
+
+/**
+ * Full preprocessing pipeline: crop → greyscale → contrast → sharpen.
+ *
+ * Returns both the base64 PNG string (sent to AI) and the data-URL
+ * (used by the debug panel).  PNG is used instead of JPEG so there
+ * are no block-artefacts around character edges.
+ *
+ * @param {HTMLCanvasElement} fullCanvas - full-resolution snapshot
+ * @param {number} stepNum               - 1=paper, 2=metal, 3=barcode
+ * @returns {{ processedBase64: string, processedDataUrl: string }}
+ */
+function preprocessImage(fullCanvas, stepNum) {
+  // Step 1: crop to viewfinder area
+  const cropped = cropToViewfinder(fullCanvas);
+
+  // Step 2: greyscale (skip for barcode — colour can help native detector)
+  if (stepNum !== 3) applyGreyscale(cropped);
+
+  // Step 3: auto-levels contrast
+  applyContrast(cropped);
+
+  // Step 4: sharpen edges
+  applySharpen(cropped);
+
+  // Export as lossless PNG — no JPEG artefacts on text edges
+  const processedDataUrl = cropped.toDataURL('image/png');
+  const processedBase64  = processedDataUrl.split(',')[1];
+
+  // Show in debug panel if enabled
+  if (state.debugMode) showDebugImage(processedDataUrl, stepNum);
+
+  return { processedBase64, processedDataUrl };
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  DEBUG MODE
+//
+//  Shows the exact preprocessed image that gets sent to the recognition
+//  engine — useful for diagnosing failures without needing DevTools.
+//
+//  ACTIVATION: tap the header title (⬡ Part Checker) 3× in quick
+//  succession.  A toast confirms the toggle.  The panel also appears
+//  automatically on any recognition failure so you can see what the AI saw.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Render a preprocessed image in a debug panel below the thumbnails.
+ * The panel is created on first call and reused thereafter.
+ * @param {string} dataUrl  - PNG data-URL of the preprocessed crop
+ * @param {number} stepNum  - which step this image belongs to
+ */
+function showDebugImage(dataUrl, stepNum) {
+  // Create the panel container if it doesn't exist yet
+  let panel = document.getElementById('debugPanel');
+  if (!panel) {
+    panel = document.createElement('div');
+    panel.id = 'debugPanel';
+    panel.style.cssText = [
+      'background:#0a0a0a',
+      'border:1px dashed #333',
+      'border-radius:4px',
+      'padding:12px',
+      'margin-top:4px'
+    ].join(';');
+    panel.innerHTML = `
+      <div style="font-family:var(--mono);font-size:0.65rem;color:#555;
+                  letter-spacing:.1em;text-transform:uppercase;margin-bottom:8px">
+        🔬 Debug — preprocessed crop sent to AI
+      </div>
+      <div id="debugImgs" style="display:flex;gap:8px;flex-wrap:wrap"></div>
+    `;
+    // Insert right after the thumbnail strip
+    const strip = document.getElementById('thumbStrip');
+    strip.parentNode.insertBefore(panel, strip.nextSibling);
+  }
+
+  // Replace image for this step if already shown
+  const container = document.getElementById('debugImgs');
+  const existing  = container.querySelector(`[data-step="${stepNum}"]`);
+  if (existing) existing.remove();
+
+  const wrap = document.createElement('div');
+  wrap.setAttribute('data-step', stepNum);
+  wrap.style.cssText = 'flex:1;min-width:80px';
+  wrap.innerHTML = `
+    <div style="font-family:var(--mono);font-size:0.6rem;color:#555;margin-bottom:4px">
+      Step ${stepNum}
+    </div>
+    <img src="${dataUrl}"
+         style="width:100%;border:1px solid #222;border-radius:2px;display:block">
+  `;
+  container.appendChild(wrap);
+}
+
+// ── Triple-tap the header title to toggle debug mode ──────────────────────
+// Uses a short 500 ms window: three taps within 500 ms = toggle.
+let _tapCount = 0;
+let _tapTimer = null;
+document.addEventListener('DOMContentLoaded', () => {
+  document.querySelector('header h1').addEventListener('click', () => {
+    _tapCount++;
+    clearTimeout(_tapTimer);
+    _tapTimer = setTimeout(() => {
+      if (_tapCount >= 3) {
+        state.debugMode = !state.debugMode;
+        // Brief floating toast
+        const toast = document.createElement('div');
+        toast.textContent = state.debugMode ? '🔬 Debug ON' : '🔬 Debug OFF';
+        toast.style.cssText = [
+          'position:fixed', 'top:56px', 'left:50%', 'transform:translateX(-50%)',
+          'background:#1a1a1a', 'color:var(--accent)',
+          'font-family:var(--mono)', 'font-size:.75rem',
+          'padding:6px 18px', 'border-radius:20px',
+          'z-index:999', 'pointer-events:none',
+          'border:1px solid var(--accent)'
+        ].join(';');
+        document.body.appendChild(toast);
+        setTimeout(() => toast.remove(), 1800);
+        // Remove the debug panel when turning off
+        if (!state.debugMode) {
+          const p = document.getElementById('debugPanel');
+          if (p) p.remove();
+        }
+      }
+      _tapCount = 0;
+    }, 500);
+  });
+});
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  CAPTURE FLOW
+//  Main action when the user taps a "Capture" button.
+//
+//  Pipeline:
+//    1. Snapshot the live video at full native camera resolution
+//    2. Apply preprocessing: crop viewfinder → greyscale → contrast → sharpen
+//    3. Freeze the camera preview (shows the original colour image)
+//    4. Send the PREPROCESSED PNG crop to the recognition engine
+//    5. On success: show value and advance to next step
+//    6. On failure: show manual entry + auto-open debug panel
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Capture → preprocess → recognise → update UI.
  * @param {number} n - step number (1, 2, or 3)
  */
 async function captureStep(n) {
-  const video   = document.getElementById('video'       + n);
-  const preview = document.getElementById('preview'     + n);
-  const btn     = document.getElementById('captureBtn'  + n);
-  const camWrap = document.getElementById('cam'         + n + 'wrap');
+  const video   = document.getElementById('video'      + n);
+  const preview = document.getElementById('preview'    + n);
+  const btn     = document.getElementById('captureBtn' + n);
+  const camWrap = document.getElementById('cam'        + n + 'wrap');
   const canvas  = document.getElementById('captureCanvas');
 
-  // If camera never started (permissions denied), fall back to manual
+  // If camera permission was denied, fall back to manual entry immediately
   if (!video.srcObject) {
     document.getElementById('manual' + n).style.display = 'flex';
     return;
   }
 
-  // ── Disable button and show scan animation ─────────────────────────────
-  btn.disabled = true;
+  // ── Disable button + show scan-line animation ──────────────────────────
+  btn.disabled    = true;
   btn.textContent = '⏳ Processing…';
   camWrap.classList.add('scanning');
 
-  // ── Snapshot video frame onto off-screen canvas ────────────────────────
-  canvas.width  = video.videoWidth  || 1280;
-  canvas.height = video.videoHeight || 720;
-  canvas.getContext('2d').drawImage(video, 0, 0);
-  const dataUrl = canvas.toDataURL('image/jpeg', 0.92); // high quality JPEG
-  const base64  = dataUrl.split(',')[1];                // strip data-URL prefix
+  // ── Snapshot at the actual camera sensor resolution ────────────────────
+  // video.videoWidth/Height reflects the negotiated camera resolution,
+  // but track.getSettings() can give the real hardware resolution on
+  // some browsers (higher quality, better OCR).
+  const track    = video.srcObject?.getVideoTracks()[0];
+  const settings = track ? track.getSettings() : {};
+  canvas.width   = settings.width  || video.videoWidth  || 1280;
+  canvas.height  = settings.height || video.videoHeight || 720;
+  canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
 
-  // ── Freeze the camera preview ──────────────────────────────────────────
-  // Copy snapshot onto the overlay <canvas> so it looks frozen
+  // ── Save original colour image for ZIP (before preprocessing) ─────────
+  const originalDataUrl = canvas.toDataURL('image/jpeg', 0.95);
+
+  // ── Preprocess: crop → greyscale → contrast → sharpen ─────────────────
+  // Yield to the browser event loop first so the scan animation renders
+  setOcr(n, `<span class="spinner"></span>&nbsp;Preprocessing…`, 'thinking');
+  await new Promise(r => setTimeout(r, 15));
+  const { processedBase64, processedDataUrl } = preprocessImage(canvas, n);
+
+  // ── Freeze preview (shows original colour image, not the grey crop) ────
   const pctx = preview.getContext('2d');
-  preview.width = canvas.width; preview.height = canvas.height;
+  preview.width  = canvas.width;
+  preview.height = canvas.height;
   pctx.drawImage(canvas, 0, 0);
   preview.style.display = 'block';
   video.style.display   = 'none';
   camWrap.classList.remove('scanning');
 
-  // Release camera (LED turns off after capture — no need to hold it)
+  // Release camera stream — LED turns off, battery is preserved
   stopCamera(n);
 
-  // ── Record timestamp of first capture ─────────────────────────────────
+  // ── Record timestamp of the very first capture in this session ─────────
   if (!state.firstTimestamp && n === 1) state.firstTimestamp = new Date();
 
-  // ── Store image and show thumbnail ────────────────────────────────────
-  state.images[n] = dataUrl;
-  const thumb = document.getElementById('thumb' + n);
-  thumb.src = dataUrl;
+  // ── Store original image + update thumbnail strip ──────────────────────
+  state.images[n] = originalDataUrl;
+  const thumb     = document.getElementById('thumb' + n);
+  thumb.src = originalDataUrl;
   thumb.classList.add('visible');
   document.getElementById('thumbStrip').style.display = 'flex';
 
-  // ── Show spinner with engine label while processing ────────────────────
+  // ── Kick off recognition on the PREPROCESSED crop ─────────────────────
   const engineHint = (state.online && state.apiKey) ? 'Claude AI' : 'Tesseract OCR';
   setOcr(n, `<span class="spinner"></span>&nbsp;Analysing with ${engineHint}…`, 'thinking');
 
-  // ── Run recognition ────────────────────────────────────────────────────
   let result;
   try {
-    result = await recognise(base64, video, n);
+    result = await recognise(processedBase64, video, n);
   } catch (e) {
-    // Unexpected error in recognition pipeline
+    // Unrecoverable error in the recognition pipeline (e.g. network failure)
     setOcr(n, '⚠ ' + e.message + ' — enter manually', 'fail');
     document.getElementById('manual' + n).style.display = 'flex';
     btn.textContent = '📷 Re-capture';
-    btn.disabled = false;
+    btn.disabled    = false;
     return;
   }
 
   const { value, engine } = result;
 
   if (value) {
-    // ── SUCCESS: show value and advance ───────────────────────────────────
+    // ── Recognition succeeded ───────────────────────────────────────────
     setOcr(n,
       `✓ <em style="opacity:.55">${engine}:</em> <strong style="color:var(--ok)">${value}</strong>`,
       'success'
@@ -1194,16 +1498,24 @@ async function captureStep(n) {
     btn.style.display = 'none';
     document.getElementById('manual' + n).style.display = 'none';
     advanceStep(n);
+
   } else {
-    // ── FAILURE: show manual entry ─────────────────────────────────────
-    const offlineNote = !state.online ? ' (offline OCR may be less accurate)' : '';
-    setOcr(n, `⚠ Could not read${offlineNote} — enter manually below`, 'fail');
+    // ── Recognition failed — show debug image automatically ─────────────
+    // This lets the user immediately see what the AI received without
+    // needing to enable debug mode manually.
+    setOcr(n,
+      `⚠ Could not read — see debug image below or enter manually`,
+      'fail'
+    );
     document.getElementById('manual' + n).style.display = 'flex';
     btn.textContent = '📷 Re-capture';
-    btn.disabled = false;
+    btn.disabled    = false;
+
+    // Always show the preprocessed crop on failure so the user can judge
+    // whether the image quality / framing needs to be improved
+    showDebugImage(processedDataUrl, n);
   }
 }
-
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  MANUAL ENTRY
