@@ -1,6 +1,6 @@
 // ── Part Checker Service Worker ──────────────────────────────────────────
 // Bumped to v3 to force re-install after Tesseract v2 migration.
-const CACHE = ‘part-checker-v5’;
+const CACHE = ‘part-checker-v6’;
 
 // App shell — cached immediately on install
 const SHELL = [
@@ -16,7 +16,9 @@ const CDN_PRECACHE = [
 // Tesseract.js v5 UMD build — works as a plain <script> tag
 ‘https://cdn.jsdelivr.net/npm/tesseract.js@5.1.0/dist/tesseract.min.js’,
 ‘https://cdn.jsdelivr.net/npm/tesseract.js@5.1.0/dist/worker.min.js’,
-‘https://cdn.jsdelivr.net/npm/tesseract.js@5.1.0/dist/tesseract-core-simd-lstm.wasm.js’
+‘https://cdn.jsdelivr.net/npm/tesseract.js@5.1.0/dist/tesseract-core-simd-lstm.wasm.js’,
+// tessdata — the eng.traineddata language file (primary source)
+‘https://cdn.jsdelivr.net/npm/tesseract.js-data@4.0.0/eng/4.0.0_best/eng.traineddata.gz’
 ];
 
 self.addEventListener(‘install’, e => {
