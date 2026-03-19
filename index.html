@@ -746,16 +746,10 @@ function setEngineBanner(cls, text) {
 /**
  * Initialise Tesseract.js v5.
  *
- * v5 is the first version with a proper UMD browser build that loads
- * correctly from a plain <script> tag without a module bundler.
- *
- * v5 API changes from v2:
- *   createWorker(lang, oem, options)  — language passed directly, no
- *   separate loadLanguage/initialize calls needed.
- *   The worker is ready to recognise immediately after createWorker resolves.
- *
- * All WASM and language files are auto-resolved from jsDelivr CDN and
- * cached by the service worker for offline use after first load.
+ * IMPORTANT: Do NOT call setParameters() during or after init in v5.
+ * Setting tessedit_char_whitelist via setParameters causes Tesseract v5
+ * to hang indefinitely on the next recognize() call.
+ * PSM is passed directly in the recognize() call options instead.
  */
 async function initTesseract() {
   if (state.tessReady || state.tessLoading) return;
@@ -765,61 +759,42 @@ async function initTesseract() {
   }
 
   state.tessLoading = true;
-  setEngineBanner('loading', '⏳ Loading OCR engine and language data…');
+  setEngineBanner('loading', '⏳ Loading OCR engine…');
 
-  // All three paths must point to the SAME version on the SAME CDN.
-  // jsDelivr hosts all Tesseract assets and is highly reliable globally.
   const BASE = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.0/dist';
-  const LANG = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.0/src/lang';
 
   try {
     state.tessWorker = await Tesseract.createWorker('eng', 1, {
-      // Explicit paths so Tesseract can find its files from a CDN <script> tag
       workerPath : `${BASE}/worker.min.js`,
       corePath   : `${BASE}/tesseract-core-simd-lstm.wasm.js`,
       langPath   : 'https://tessdata.projectnaptha.com/4.0.0_best',
-      logger     : () => {}
-    });
-
-    await state.tessWorker.setParameters({
-      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -'
+      // Show progress in console so we can confirm it is alive
+      logger: m => {
+        if (m.status === 'recognizing text') {
+          console.log('[Tesseract] recognizing…', Math.round((m.progress || 0) * 100) + '%');
+        }
+      }
     });
 
     state.tessReady   = true;
     state.tessLoading = false;
-    setEngineBanner('ready', '✓ Tesseract OCR ready (offline)');
+    setEngineBanner('ready', '✓ Tesseract OCR ready');
+    console.log('[PartChecker] Tesseract worker ready');
   } catch (e) {
     state.tessLoading = false;
-    console.error('Tesseract init failed:', e);
-    // Try fallback: no explicit paths, let Tesseract guess (works on some hosts)
-    setEngineBanner('loading', '⏳ Retrying OCR engine load…');
-    try {
-      state.tessWorker = await Tesseract.createWorker('eng', 1, { logger: () => {} });
-      await state.tessWorker.setParameters({
-        tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -'
-      });
-      state.tessReady   = true;
-      state.tessLoading = false;
-      setEngineBanner('ready', '✓ Tesseract OCR ready');
-    } catch (e2) {
-      state.tessLoading = false;
-      console.error('Tesseract fallback also failed:', e2);
-      setEngineBanner('error', `✗ OCR failed (${e2.message}) — use manual entry`);
-    }
+    console.error('[PartChecker] Tesseract init error:', e);
+    setEngineBanner('error', `✗ OCR failed to load (${e.message})`);
   }
 }
 
 /**
- * Run Tesseract OCR on a preprocessed PNG image.
+ * Run Tesseract OCR on a PNG data-URL.
+ * PSM is passed directly in the recognize() options — NOT via setParameters.
+ * setParameters with char_whitelist causes Tesseract v5 to hang.
  *
- * PSM (Page Segmentation Mode) is tuned per step:
- *   '7' = SINGLE_LINE  — paper label (one clean printed line)
- *   '8' = SINGLE_WORD  — metal stamp (tight block of chars)
- *   '6' = SINGLE_BLOCK — barcode text label
- *
- * @param {string} pngDataUrl - preprocessed PNG (full data-URL)
- * @param {number} stepNum    - 1=paper, 2=metal, 3=barcode
- * @returns {Promise<string|null>} raw OCR text or null
+ * PSM values:
+ *   7 = single text line  (paper + metal)
+ *   6 = single text block (barcode)
  */
 async function runTesseract(pngDataUrl, stepNum) {
   if (!state.tessReady) {
@@ -827,22 +802,19 @@ async function runTesseract(pngDataUrl, stepNum) {
     if (!state.tessReady) return null;
   }
 
-  // PSM per step:
-  //   1 (paper)   = 7 SINGLE_LINE  — one clean printed line
-  //   2 (metal)   = 7 SINGLE_LINE  — stamped number is ONE line: "HY32 16151 AB"
-  //                  PSM 6 (block) was causing Tesseract to invent characters
-  //                  from surface noise on imaginary "other lines"
-  //   3 (barcode) = 6 SINGLE_BLOCK — label with mixed content
-  const psm = { 1: '7', 2: '7', 3: '6' }[stepNum] || '7';
+  const psm = stepNum === 3 ? 6 : 7;
 
+  console.log('[PartChecker] recognize() start — PSM:', psm,
+              'image bytes:', pngDataUrl.length, 'step:', stepNum);
   try {
-    console.log('[PartChecker] runTesseract PSM:', psm, '— image length:', pngDataUrl.length);
-    await state.tessWorker.setParameters({ tessedit_pageseg_mode: psm });
-    const { data: { text, confidence } } = await state.tessWorker.recognize(pngDataUrl);
-    console.log('[PartChecker] Tesseract raw text:', JSON.stringify(text), '— confidence:', confidence);
-    return text.trim().toUpperCase() || null;
+    const { data } = await state.tessWorker.recognize(pngDataUrl, {},
+      { tessedit_pageseg_mode: psm }
+    );
+    console.log('[PartChecker] recognize() done — text:', JSON.stringify(data.text),
+                'confidence:', data.confidence);
+    return data.text.trim().toUpperCase() || null;
   } catch (e) {
-    console.error('[PartChecker] Tesseract recognize() threw:', e);
+    console.error('[PartChecker] recognize() error:', e);
     return null;
   }
 }
