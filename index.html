@@ -3,11 +3,13 @@
 <!--
   ╔══════════════════════════════════════════════════════════════════════════╗
   ║  PART CHECKER  —  Industrial Part Number Verification PWA               ║
+  ║  Fully offline — Tesseract.js OCR only, no external API needed          ║
   ║                                                                          ║
   ║  WORKFLOW:                                                               ║
-  ║    Step 1 → Capture printed paper label  → AI reads part number         ║
-  ║    Step 2 → Capture metal part surface   → AI reads stamped/engraved #  ║
-  ║    Step 3 → Capture barcode / QR label   → AI or native decoder reads   ║
+  ║    Step 1 → Capture printed paper label  → Tesseract reads part number  ║
+  ║    Step 2 → Capture metal part surface   → Tesseract reads stamped #    ║
+  ║    Step 3 → Capture barcode / QR label   → Native BarcodeDetector or    ║
+  ║                                            Tesseract reads value        ║
   ║    Result → Compare all three, display OK / NOK, save ZIP with images   ║
   ║                                                                          ║
   ║  PART NUMBER FORMATS:                                                    ║
@@ -17,14 +19,22 @@
   ║                      e.g.  "AB12-34567-CD"  or  "1A2B 34567E 89"       ║
   ║                      Stored internally WITHOUT separators for comparison ║
   ║                                                                          ║
-  ║  RECOGNITION ENGINES (auto-selected):                                   ║
-  ║    Online  + API key  →  Claude Vision AI  (most accurate)              ║
-  ║    Online, no API key →  Tesseract OCR     (cached by service worker)   ║
-  ║    Offline            →  Tesseract OCR     (fully on-device)            ║
-  ║    Barcode (any)      →  Native BarcodeDetector API first, then fallback ║
+  ║  TESSERACT OCR NOTES:                                                    ║
+  ║    • Pre-trained on English text (books, documents, printed fonts)       ║
+  ║    • NOT specifically trained on industrial stamped/engraved fonts       ║
+  ║    • We compensate with: image preprocessing (crop, contrast, sharpen), ║
+  ║      PSM mode tuning per step, and strict character whitelisting         ║
+  ║    • Native BarcodeDetector handles barcodes more reliably offline       ║
+  ║                                                                          ║
+  ║  CROP BUG FIX:                                                           ║
+  ║    The camera video is 16:9 native but displayed in a 4:3 CSS box       ║
+  ║    with object-fit:cover — meaning the top/bottom of the native frame   ║
+  ║    is letterboxed out. The viewfinder bracket is positioned in the      ║
+  ║    displayed box, NOT in native canvas coordinates. We compute the      ║
+  ║    correct mapping from displayed pixels → canvas pixels before crop.   ║
   ║                                                                          ║
   ║  FILES:                                                                  ║
-  ║    index.html   — this file (entire app, single-file PWA)               ║
+  ║    index.html    — this file (entire app, single-file PWA)              ║
   ║    manifest.json — PWA metadata (name, icons, theme)                    ║
   ║    sw.js         — service worker (caching, offline support)            ║
   ║    icon.svg      — app icon                                             ║
@@ -34,214 +44,153 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <!-- Prevent zoom on mobile — important for camera UI -->
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <!-- PWA theme color (Chrome Android toolbar) -->
   <meta name="theme-color" content="#0a0a0a">
-  <!-- iOS PWA: run as standalone app (no Safari chrome) -->
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <!-- PWA manifest link -->
   <link rel="manifest" href="manifest.json">
   <title>Part Checker</title>
 
   <style>
-    /* ── DESIGN TOKENS ──────────────────────────────────────────────────────
-       Central colour + font variables. Edit here to retheme the whole app. */
+    /* ── DESIGN TOKENS ─────────────────────────────────────────────────── */
     @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow+Condensed:wght@300;500;700;900&display=swap');
 
     :root {
-      --bg:      #0a0a0a;   /* page background           */
-      --surface: #111111;   /* card / header background  */
-      --border:  #222222;   /* subtle divider lines      */
-      --accent:  #00e5ff;   /* cyan — active elements    */
-      --ok:      #00ff88;   /* green — success           */
-      --nok:     #ff2d55;   /* red   — failure           */
-      --warn:    #ffaa00;   /* amber — offline / warning */
-      --text:    #e8e8e8;   /* primary body text         */
-      --muted:   #555555;   /* de-emphasised text        */
-      --mono: 'Share Tech Mono', monospace;   /* codes, values */
-      --sans: 'Barlow Condensed', sans-serif; /* headings, UI  */
+      --bg:      #0a0a0a;
+      --surface: #111111;
+      --border:  #222222;
+      --accent:  #00e5ff;
+      --ok:      #00ff88;
+      --nok:     #ff2d55;
+      --warn:    #ffaa00;
+      --text:    #e8e8e8;
+      --muted:   #555555;
+      --mono: 'Share Tech Mono', monospace;
+      --sans: 'Barlow Condensed', sans-serif;
     }
 
-    /* ── RESET ──────────────────────────────────────────────────────────── */
+    /* ── RESET ─────────────────────────────────────────────────────────── */
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body {
-      background: var(--bg);
-      color: var(--text);
-      font-family: var(--sans);
-      overflow-x: hidden;
+      background: var(--bg); color: var(--text);
+      font-family: var(--sans); overflow-x: hidden;
       -webkit-font-smoothing: antialiased;
     }
     body { display: flex; flex-direction: column; min-height: 100dvh; }
 
-    /* ── HEADER ─────────────────────────────────────────────────────────────
-       Sticky top bar: app title | connectivity pill | step dots            */
+    /* ── HEADER ────────────────────────────────────────────────────────── */
     header {
-      padding: 12px 20px;
-      border-bottom: 1px solid var(--border);
+      padding: 12px 20px; border-bottom: 1px solid var(--border);
       display: flex; align-items: center; justify-content: space-between;
-      background: var(--surface);
-      position: sticky; top: 0; z-index: 100;
-      gap: 12px;
+      background: var(--surface); position: sticky; top: 0; z-index: 100; gap: 12px;
     }
     header h1 {
-      font-weight: 900; font-size: 1.25rem;
-      letter-spacing: 0.12em; text-transform: uppercase;
-      color: var(--accent); white-space: nowrap;
+      font-weight: 900; font-size: 1.25rem; letter-spacing: 0.12em;
+      text-transform: uppercase; color: var(--accent); white-space: nowrap;
+      cursor: default; /* triple-tap target for debug mode */
     }
 
-    /* ── CONNECTIVITY PILL ───────────────────────────────────────────────
-       Shows "Online · AI" or "Offline · OCR" in top-right of header.
-       Class toggled by JS when navigator.onLine changes.                 */
-    #connPill {
-      display: flex; align-items: center; gap: 6px;
-      padding: 4px 10px; border-radius: 20px;
-      font-family: var(--mono); font-size: 0.65rem;
-      letter-spacing: 0.08em; text-transform: uppercase;
-      border: 1px solid; white-space: nowrap; transition: all 0.4s;
+    /* ── OCR ENGINE STATUS BANNER ──────────────────────────────────────
+       Shows Tesseract loading state / ready state below the header.    */
+    #engineBanner {
+      padding: 7px 16px; font-family: var(--mono); font-size: 0.68rem;
+      letter-spacing: 0.07em; text-align: center; display: none;
     }
-    #connPill.online  { color: var(--ok);   border-color: var(--ok);   background: rgba(0,255,136,0.08); }
-    #connPill.offline { color: var(--warn); border-color: var(--warn); background: rgba(255,170,0,0.08); }
-    #connPill .dot2   { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
-    /* pulse animation when online */
-    #connPill.online .dot2 { animation: blink 2s ease-in-out infinite; }
-    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+    #engineBanner.ready   { background: rgba(0,229,255,0.06); color: var(--accent);
+                            border-bottom: 1px solid rgba(0,229,255,0.15); display: block; }
+    #engineBanner.loading { background: rgba(255,255,255,0.04); color: var(--muted);
+                            border-bottom: 1px solid var(--border); display: block; }
+    #engineBanner.error   { background: rgba(255,45,85,0.07); color: var(--nok);
+                            border-bottom: 1px solid rgba(255,45,85,0.2); display: block; }
 
-    /* ── STEP PROGRESS DOTS ─────────────────────────────────────────────── */
+    /* ── STEP PROGRESS DOTS ────────────────────────────────────────────── */
     .step-indicator { display: flex; gap: 6px; align-items: center; }
     .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); transition: all 0.3s; }
     .dot.active { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
     .dot.done   { background: var(--ok); }
 
-    /* ── API KEY BANNER ──────────────────────────────────────────────────
-       Orange bar shown when no API key is stored.
-       User pastes Anthropic key here; it is saved to localStorage.       */
-    #apiKeyBanner {
-      background: #150800; border-bottom: 1px solid #994400;
-      padding: 10px 16px; display: flex; gap: 8px;
-      align-items: center; flex-wrap: wrap;
-    }
-    #apiKeyBanner.hidden { display: none; }
-    #apiKeyBanner > span { font-family: var(--mono); font-size: 0.7rem; color: #ff9944; flex: 1; min-width: 160px; }
-    #apiKeyInput {
-      flex: 2; min-width: 160px; background: #000;
-      border: 1px solid #994400; color: var(--text);
-      font-family: var(--mono); font-size: 0.78rem;
-      padding: 6px 10px; border-radius: 2px; outline: none;
-    }
-    #apiKeyInput:focus { border-color: var(--accent); }
-    #apiKeySaveBtn {
-      padding: 6px 14px; background: #cc5500; border: none;
-      color: #fff; font-family: var(--sans); font-weight: 700;
-      font-size: 0.85rem; letter-spacing: 0.1em;
-      cursor: pointer; border-radius: 2px; text-transform: uppercase;
-    }
-
-    /* ── ENGINE STATUS BANNER ────────────────────────────────────────────
-       Thin info bar below API key banner, shows which OCR engine
-       is currently active and why.
-       Classes: .online (cyan) | .offline (amber) | .loading (grey)       */
-    #engineBanner {
-      padding: 7px 16px; font-family: var(--mono);
-      font-size: 0.68rem; letter-spacing: 0.07em;
-      text-align: center; display: none;
-    }
-    #engineBanner.online  { background: rgba(0,229,255,0.06); color: var(--accent); border-bottom: 1px solid rgba(0,229,255,0.15); display: block; }
-    #engineBanner.offline { background: rgba(255,170,0,0.07);  color: var(--warn);  border-bottom: 1px solid rgba(255,170,0,0.2);  display: block; }
-    #engineBanner.loading { background: rgba(255,255,255,0.04); color: var(--muted); border-bottom: 1px solid var(--border); display: block; }
-
-    /* ── MAIN CONTENT AREA ──────────────────────────────────────────────── */
+    /* ── MAIN ──────────────────────────────────────────────────────────── */
     main {
       flex: 1; display: flex; flex-direction: column;
       padding: 20px; gap: 16px;
       max-width: 600px; width: 100%; margin: 0 auto;
     }
 
-    /* ── STEP LABEL (small text above each card heading) ─────────────────── */
+    /* ── STEP LABEL ────────────────────────────────────────────────────── */
     .step-label {
-      font-family: var(--mono); font-size: 0.7rem;
-      color: var(--accent); letter-spacing: 0.15em;
-      text-transform: uppercase; margin-bottom: 4px;
+      font-family: var(--mono); font-size: 0.7rem; color: var(--accent);
+      letter-spacing: 0.15em; text-transform: uppercase; margin-bottom: 4px;
     }
 
-    /* ── CARD ────────────────────────────────────────────────────────────
-       Each step lives in a card. The left accent bar pulses on the
-       active card to draw attention.                                       */
+    /* ── CARD ──────────────────────────────────────────────────────────── */
     .card {
       background: var(--surface); border: 1px solid var(--border);
       border-radius: 4px; padding: 16px; position: relative; overflow: hidden;
     }
-    /* Left accent stripe */
+    /* Left accent stripe — pulses on active step */
     .card::before {
       content: ''; position: absolute; top: 0; left: 0;
       width: 3px; height: 100%; background: var(--accent);
     }
-    /* Pulse animation on currently-active step */
     .card.active-step::before { animation: accentPulse 1.5s ease-in-out infinite alternate; }
     @keyframes accentPulse { from{opacity:1} to{opacity:0.25} }
-
     .card h2 {
-      font-size: 1.1rem; font-weight: 700;
-      letter-spacing: 0.08em; text-transform: uppercase;
-      margin-bottom: 12px; padding-left: 10px;
+      font-size: 1.1rem; font-weight: 700; letter-spacing: 0.08em;
+      text-transform: uppercase; margin-bottom: 12px; padding-left: 10px;
     }
 
-    /* ── CAMERA CONTAINER ────────────────────────────────────────────────
-       Fixed 4:3 aspect ratio box holding the live <video> feed.
-       After capture, a <canvas> overlays the frozen frame.               */
+    /* ── CAMERA CONTAINER ──────────────────────────────────────────────
+       4:3 aspect-ratio box.  The live <video> uses object-fit:cover
+       which may letterbox a 16:9 camera feed — we account for this
+       in the crop calculation.                                          */
     .camera-container {
       position: relative; width: 100%; aspect-ratio: 4/3;
       background: #000; border-radius: 2px; overflow: hidden;
       border: 1px solid var(--border);
     }
-    /* Live video feed */
+    /* Live video — object-fit:cover centres and crops the 16:9 feed
+       to fill the 4:3 box.  The browser hides the left/right edges.   */
     .camera-container video {
       width: 100%; height: 100%; object-fit: cover; display: block;
     }
-    /* Frozen snapshot canvas — hidden until capture */
+    /* Frozen preview canvas shown after capture */
     .camera-container canvas.preview {
       width: 100%; height: 100%; object-fit: cover;
       position: absolute; top: 0; left: 0; display: none;
     }
 
-    /* ── VIEWFINDER OVERLAY ──────────────────────────────────────────────
-       Corner-bracket rectangle drawn in pure CSS, guides user to frame
-       the part number inside the highlighted zone.                        */
+    /* ── VIEWFINDER OVERLAY ─────────────────────────────────────────────
+       Corner-bracket rectangle.  Proportions must match the crop
+       constants in cropToViewfinder() — both use VF_W=0.80, VF_H=0.45. */
     .viewfinder {
       position: absolute; top: 50%; left: 50%;
-      transform: translate(-50%,-50%);
-      width: 80%; height: 45%;
+      transform: translate(-50%, -50%);
+      width: 80%; height: 45%;           /* ← must match VF_W / VF_H */
       border: 2px solid var(--accent);
-      pointer-events: none; opacity: 0.55;
+      pointer-events: none; opacity: 0.7;
     }
-    /* Four corner brackets via pseudo-elements on .viewfinder and its <span> */
     .viewfinder::before, .viewfinder::after,
     .viewfinder span::before, .viewfinder span::after {
-      content: ''; position: absolute;
-      width: 16px; height: 16px;
+      content: ''; position: absolute; width: 18px; height: 18px;
       border-color: var(--accent); border-style: solid;
     }
-    .viewfinder::before      { top:-2px;    left:-2px;  border-width: 2px 0 0 2px; }
-    .viewfinder::after       { top:-2px;    right:-2px; border-width: 2px 2px 0 0; }
-    .viewfinder span::before { bottom:-2px; left:-2px;  border-width: 0 0 2px 2px; }
-    .viewfinder span::after  { bottom:-2px; right:-2px; border-width: 0 2px 2px 0; }
+    .viewfinder::before      { top:-2px;    left:-2px;  border-width: 3px 0 0 3px; }
+    .viewfinder::after       { top:-2px;    right:-2px; border-width: 3px 3px 0 0; }
+    .viewfinder span::before { bottom:-2px; left:-2px;  border-width: 0 0 3px 3px; }
+    .viewfinder span::after  { bottom:-2px; right:-2px; border-width: 0 3px 3px 0; }
 
-    /* ── SCAN LINE ANIMATION ─────────────────────────────────────────────
-       Horizontal cyan glow sweeps top→bottom inside the camera box
-       while AI/OCR processing is happening. Hidden by default,
-       activated by adding class .scanning to the camera container.       */
+    /* ── SCAN LINE ANIMATION ────────────────────────────────────────────
+       Cyan glow sweeps through the viewfinder while OCR runs.          */
     .scan-line {
-      display: none;
-      position: absolute; left: 0; right: 0; height: 2px;
+      display: none; position: absolute; left: 0; right: 0; height: 2px;
       background: linear-gradient(to right, transparent, var(--accent), transparent);
-      box-shadow: 0 0 10px var(--accent);
-      top: 20%; animation: scanMove 1.4s ease-in-out infinite;
+      box-shadow: 0 0 10px var(--accent); top: 20%;
+      animation: scanMove 1.4s ease-in-out infinite;
     }
     @keyframes scanMove { 0%{top:20%;opacity:1} 90%{top:80%;opacity:1} 100%{top:80%;opacity:0} }
     .scanning .scan-line { display: block; }
 
-    /* ── CAPTURE BUTTON ─────────────────────────────────────────────────── */
+    /* ── BUTTONS ────────────────────────────────────────────────────────── */
     .capture-btn {
       display: block; width: 100%; margin-top: 12px; padding: 14px;
       background: transparent; border: 1px solid var(--accent); color: var(--accent);
@@ -252,54 +201,40 @@
     .capture-btn:active   { background: var(--accent); color: #000; }
     .capture-btn:disabled { opacity: 0.3; cursor: not-allowed; }
 
-    /* ── RETAKE BUTTON ───────────────────────────────────────────────────
-       Appears after a successful capture to allow re-scanning.           */
     .retake-btn {
       padding: 6px 14px; background: transparent;
       border: 1px solid var(--muted); color: var(--muted);
-      font-family: var(--mono); font-size: 0.7rem;
-      letter-spacing: 0.1em; text-transform: uppercase;
-      cursor: pointer; border-radius: 2px; margin-top: 8px;
-      transition: all 0.15s; display: none;
+      font-family: var(--mono); font-size: 0.7rem; letter-spacing: 0.1em;
+      text-transform: uppercase; cursor: pointer; border-radius: 2px;
+      margin-top: 8px; transition: all 0.15s; display: none;
     }
     .retake-btn:hover { color: var(--text); border-color: var(--text); }
 
-    /* ── MANUAL ENTRY ROW ────────────────────────────────────────────────
-       Shown when OCR fails or camera is unavailable.
-       Hidden (display:none) by default; JS sets display:flex.           */
+    /* ── MANUAL ENTRY ───────────────────────────────────────────────────── */
     .manual-input-wrap { display: none; gap: 8px; align-items: center; margin-top: 8px; }
     .manual-input {
-      flex: 1; background: #000; border: 1px solid var(--border);
-      color: var(--text); font-family: var(--mono); font-size: 1rem;
-      padding: 10px 12px; border-radius: 2px;
-      text-transform: uppercase; letter-spacing: 0.1em;
-      outline: none; transition: border-color 0.2s;
+      flex: 1; background: #000; border: 1px solid var(--border); color: var(--text);
+      font-family: var(--mono); font-size: 1rem; padding: 10px 12px; border-radius: 2px;
+      text-transform: uppercase; letter-spacing: 0.1em; outline: none; transition: border-color 0.2s;
     }
     .manual-input:focus { border-color: var(--accent); }
     .manual-confirm-btn {
-      padding: 10px 16px; background: var(--accent);
-      border: none; color: #000; font-family: var(--sans);
-      font-weight: 700; font-size: 0.9rem; letter-spacing: 0.1em;
-      cursor: pointer; border-radius: 2px; text-transform: uppercase;
+      padding: 10px 16px; background: var(--accent); border: none; color: #000;
+      font-family: var(--sans); font-weight: 700; font-size: 0.9rem;
+      letter-spacing: 0.1em; cursor: pointer; border-radius: 2px; text-transform: uppercase;
     }
 
-    /* ── OCR STATUS ROW ──────────────────────────────────────────────────
-       Single line below capture button that shows processing status,
-       detected value, or error. Class drives the text colour.           */
+    /* ── OCR STATUS ROW ─────────────────────────────────────────────────── */
     .ocr-result {
       font-family: var(--mono); font-size: 0.75rem; color: var(--muted);
       text-align: center; padding: 6px 4px; min-height: 30px;
       display: flex; align-items: center; justify-content: center; gap: 6px;
     }
-    .ocr-result.thinking { color: var(--accent); } /* processing…      */
-    .ocr-result.success  { color: var(--ok); }     /* value found      */
-    .ocr-result.warn     { color: var(--warn); }   /* low-confidence   */
-    .ocr-result.fail     { color: var(--nok); }    /* could not read   */
+    .ocr-result.thinking { color: var(--accent); }
+    .ocr-result.success  { color: var(--ok); }
+    .ocr-result.fail     { color: var(--nok); }
 
-    /* ── PART NUMBER DISPLAY ─────────────────────────────────────────────
-       Large monospace box showing the detected / entered value.
-       .empty    → placeholder dash text (grey, smaller)
-       .confirmed → value locked in (green border glow)                  */
+    /* ── PART NUMBER DISPLAY ─────────────────────────────────────────────── */
     .part-display {
       font-family: var(--mono); font-size: 1.6rem; letter-spacing: 0.15em;
       color: var(--accent); text-align: center; padding: 14px 8px;
@@ -310,18 +245,13 @@
     .part-display.empty     { color: var(--muted); font-size: 0.85rem; letter-spacing: 0.05em; }
     .part-display.confirmed { border-color: var(--ok); color: var(--ok); }
 
-    /* ── FORMAT HINT ─────────────────────────────────────────────────────
-       Small grey text explaining expected format below the display box. */
+    /* Format hint below display box */
     .format-hint {
-      font-family: var(--mono); font-size: 0.65rem;
-      color: var(--muted); text-align: center;
-      padding: 3px 0; letter-spacing: 0.06em;
+      font-family: var(--mono); font-size: 0.65rem; color: var(--muted);
+      text-align: center; padding: 3px 0; letter-spacing: 0.06em;
     }
 
-    /* ── COMPARISON GRID ─────────────────────────────────────────────────
-       Two rows of "value vs value" shown in the result card.
-       Row 1: Paper  vs  Metal
-       Row 2: Metal  vs  Barcode                                          */
+    /* ── COMPARISON GRID ─────────────────────────────────────────────────── */
     .compare-grid {
       display: grid; grid-template-columns: 1fr 28px 1fr;
       gap: 8px; align-items: center; margin-bottom: 8px;
@@ -339,40 +269,31 @@
     .compare-val.nok-val { color: var(--nok); border-color: var(--nok); }
     .vs-lbl { font-family: var(--mono); color: var(--muted); font-size: 0.7rem; text-align: center; }
 
-    /* ── STATUS BANNER ───────────────────────────────────────────────────
-       Full-width OK / NOK result shown after all 3 steps complete.
-       Hidden (display:none) until finalise() runs.
-       .ok  → green glow   .nok → red glow                               */
+    /* ── STATUS BANNER ───────────────────────────────────────────────────── */
     .status-banner {
       display: none; width: 100%; padding: 32px 16px; text-align: center;
-      border-radius: 4px; border: 2px solid;
-      flex-direction: column; gap: 8px;
+      border-radius: 4px; border: 2px solid; flex-direction: column; gap: 8px;
       animation: bangIn 0.3s cubic-bezier(0.2, 1.5, 0.5, 1);
     }
     @keyframes bangIn { from{transform:scale(0.85);opacity:0} to{transform:scale(1);opacity:1} }
     .status-banner.ok  { border-color: var(--ok);  background: rgba(0,255,136,0.06); display: flex; }
     .status-banner.nok { border-color: var(--nok); background: rgba(255,45,85,0.06);  display: flex; }
-    /* Giant OK / NOK text */
     .status-big {
       font-family: var(--sans); font-size: 5.5rem; font-weight: 900;
       letter-spacing: 0.1em; line-height: 1;
     }
     .status-banner.ok  .status-big { color: var(--ok);  text-shadow: 0 0 40px var(--ok); }
     .status-banner.nok .status-big { color: var(--nok); text-shadow: 0 0 40px var(--nok); }
-    /* Mismatch detail line */
     .status-sub { font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.08em; opacity: 0.65; }
 
-    /* ── THUMBNAIL STRIP ─────────────────────────────────────────────────
-       Three small preview thumbnails, one per captured image.
-       Each starts display:none; .visible class shows it.                */
+    /* ── THUMBNAILS ──────────────────────────────────────────────────────── */
     .thumb-strip { display: none; gap: 8px; }
     .thumb { flex: 1; aspect-ratio: 4/3; object-fit: cover; border: 1px solid var(--border); border-radius: 2px; display: none; }
     .thumb.visible { display: block; }
 
-    /* ── FOLDER NAME / SAVE INFO ─────────────────────────────────────────── */
     .saved-info { font-family: var(--mono); font-size: 0.7rem; color: var(--muted); text-align: center; padding: 4px 0; }
 
-    /* ── ACTION BUTTONS (Download ZIP + New Inspection) ──────────────────── */
+    /* ── ACTION BUTTONS ─────────────────────────────────────────────────── */
     .dl-btn, .reset-btn {
       display: none; width: 100%; padding: 14px; background: transparent;
       font-family: var(--sans); font-size: 1rem; font-weight: 700;
@@ -383,11 +304,9 @@
     .reset-btn { border: 1px solid var(--muted); color: var(--text); margin-top: 4px; }
     .dl-btn:hover    { background: rgba(0,255,136,0.10); }
     .reset-btn:hover { border-color: var(--text); }
-    /* JS adds .visible to show these */
     .dl-btn.visible, .reset-btn.visible { display: block; }
 
-    /* ── STEP STATUS BADGE ───────────────────────────────────────────────
-       Inline badge next to card heading: "Pending" or "Done"            */
+    /* ── BADGE ───────────────────────────────────────────────────────────── */
     .badge {
       display: inline-block; padding: 2px 8px; border-radius: 2px;
       font-family: var(--mono); font-size: 0.65rem;
@@ -397,8 +316,7 @@
     .badge-pending { background: rgba(255,255,255,0.07); color: var(--muted); }
     .badge-done    { background: rgba(0,255,136,0.15);   color: var(--ok); }
 
-    /* ── SPINNER ─────────────────────────────────────────────────────────
-       CSS-only rotating ring used in the OCR status row.                */
+    /* ── SPINNER ─────────────────────────────────────────────────────────── */
     .spinner {
       display: inline-block; width: 12px; height: 12px;
       border: 2px solid currentColor; border-top-color: transparent;
@@ -406,26 +324,36 @@
     }
     @keyframes spin { to { transform: rotate(360deg); } }
 
-    /* ── HIDDEN UTILITY CANVAS ───────────────────────────────────────────
-       Off-screen canvas used to snapshot video frames for OCR.         */
+    /* ── DEBUG PANEL ─────────────────────────────────────────────────────
+       Shows the exact preprocessed crop sent to Tesseract.
+       Toggled by triple-tapping the header title, or auto-shown on fail. */
+    #debugPanel {
+      background: #0a0a0a; border: 1px dashed #333; border-radius: 4px;
+      padding: 12px; margin-top: 4px; display: none;
+    }
+    #debugPanel.visible { display: block; }
+    #debugPanel .debug-title {
+      font-family: var(--mono); font-size: 0.65rem; color: #555;
+      letter-spacing: .1em; text-transform: uppercase; margin-bottom: 8px;
+    }
+    #debugImgs { display: flex; gap: 8px; flex-wrap: wrap; }
+    .debug-img-wrap { flex: 1; min-width: 80px; }
+    .debug-img-wrap .debug-step-label {
+      font-family: var(--mono); font-size: 0.6rem; color: #555; margin-bottom: 4px;
+    }
+    .debug-img-wrap img { width: 100%; border: 1px solid #222; border-radius: 2px; display: block; }
+
     canvas.hidden { display: none; }
   </style>
 
 </head>
 <body>
 
-<!-- ═══════════════════════════════════════════════════════════════════════
-     HEADER
-     ════════════════════════════════════════════════════════════════════ -->
+<!-- ═══ HEADER ══════════════════════════════════════════════════════════ -->
 
 <header>
   <h1>⬡ Part Checker</h1>
-  <!-- Connectivity pill: toggled between .online / .offline by JS -->
-  <div id="connPill" class="online">
-    <div class="dot2"></div>
-    <span id="connLabel">Online · AI</span>
-  </div>
-  <!-- Step progress dots (3 steps) -->
+  <!-- Step progress dots -->
   <div class="step-indicator">
     <div class="dot active" id="d1"></div>
     <div class="dot"        id="d2"></div>
@@ -433,148 +361,84 @@
   </div>
 </header>
 
-<!-- ═══════════════════════════════════════════════════════════════════════
-     API KEY BANNER
-     Shown when no API key is stored in localStorage.
-     Collapses after user saves a valid key.
-     ════════════════════════════════════════════════════════════════════ -->
+<!-- Tesseract loading / ready / error status bar -->
 
-<div id="apiKeyBanner">
-  <span>🔑 Anthropic API key for online AI recognition</span>
-  <input id="apiKeyInput" type="password" placeholder="sk-ant-api03-…" autocomplete="off">
-  <button id="apiKeySaveBtn" onclick="saveApiKey()">Save Key</button>
-</div>
+<div id="engineBanner" class="loading">⏳ Loading Tesseract OCR engine…</div>
 
-<!-- Active OCR engine info bar -->
-
-<div id="engineBanner" class="loading">⏳ Loading offline OCR engine…</div>
-
-<!-- ═══════════════════════════════════════════════════════════════════════
-     MAIN CONTENT
-     Three step cards → comparison card → status banner → actions
-     ════════════════════════════════════════════════════════════════════ -->
+<!-- ═══ MAIN ══════════════════════════════════════════════════════════════ -->
 
 <main>
 
-  <!-- ── STEP 1: Paper label ────────────────────────────────────────────
-       Capture the printed paper label.
-       Expected: 10–11 alphanumeric characters (letters + digits).       -->
+  <!-- STEP 1: Paper label -->
 
   <div class="card active-step" id="card1">
     <div class="step-label">Step 1 / 3</div>
     <h2>Paper Part Number <span class="badge badge-pending" id="badge1">Pending</span></h2>
-
-```
-<!-- Camera viewport with viewfinder overlay and scan animation -->
-<div class="camera-container" id="cam1wrap">
-  <video id="video1" autoplay playsinline muted></video>
-  <canvas class="preview" id="preview1"></canvas>
-  <div class="viewfinder"><span></span></div>
-  <div class="scan-line"></div>
-</div>
-
-<button class="capture-btn" id="captureBtn1" onclick="captureStep(1)">📷 Capture Paper Label</button>
-
-<!-- OCR status / result message -->
-<div class="ocr-result" id="ocr1">Point camera at printed part number</div>
-
-<!-- Manual entry fallback (shown when OCR fails or camera unavailable) -->
-<div class="manual-input-wrap" id="manual1">
-  <input class="manual-input" id="manualInput1" maxlength="11"
-         placeholder="e.g. AB12CD34EF5" oninput="sanitizePartInput(this)">
-  <button class="manual-confirm-btn" onclick="confirmManual(1)">Set</button>
-</div>
-
-<!-- Large detected value display -->
-<div class="part-display empty" id="partDisplay1">— — — — — — — — — —</div>
-<!-- Format hint below display -->
-<div class="format-hint">Paper: 10–11 alphanumeric characters</div>
-
-<button class="retake-btn" id="retake1" onclick="retakeStep(1)">↺ Retake</button>
-```
-
+    <div class="camera-container" id="cam1wrap">
+      <video id="video1" autoplay playsinline muted></video>
+      <canvas class="preview" id="preview1"></canvas>
+      <div class="viewfinder"><span></span></div>
+      <div class="scan-line"></div>
+    </div>
+    <button class="capture-btn" id="captureBtn1" onclick="captureStep(1)">📷 Capture Paper Label</button>
+    <div class="ocr-result" id="ocr1">Point camera — keep part number inside the box</div>
+    <div class="manual-input-wrap" id="manual1">
+      <input class="manual-input" id="manualInput1" maxlength="11"
+             placeholder="e.g. AB12CD34EF5" oninput="sanitizePartInput(this)">
+      <button class="manual-confirm-btn" onclick="confirmManual(1)">Set</button>
+    </div>
+    <div class="part-display empty" id="partDisplay1">— — — — — — — — — —</div>
+    <div class="format-hint">Paper: 10–11 alphanumeric characters</div>
+    <button class="retake-btn" id="retake1" onclick="retakeStep(1)">↺ Retake</button>
   </div>
 
-  <!-- ── STEP 2: Metal / steel part ────────────────────────────────────
-       Capture the stamped or engraved part number on the metal surface.
-       Expected format: XXXX[-/ ]XXXXX[X][-/ ]XX
-         Group 1: 4 chars (letters + digits)
-         Separator: space or "-"
-         Group 2: 5 or 6 chars (letters + digits)
-         Separator: space or "-"
-         Group 3: 2 chars (letters + digits)
-       Stored internally without separators for comparison.              -->
+  <!-- STEP 2: Metal surface -->
 
   <div class="card" id="card2">
     <div class="step-label">Step 2 / 3</div>
     <h2>Metal Part Number <span class="badge badge-pending" id="badge2">Pending</span></h2>
-
-```
-<div class="camera-container" id="cam2wrap">
-  <video id="video2" autoplay playsinline muted></video>
-  <canvas class="preview" id="preview2"></canvas>
-  <div class="viewfinder"><span></span></div>
-  <div class="scan-line"></div>
-</div>
-
-<button class="capture-btn" id="captureBtn2" onclick="captureStep(2)" disabled>📷 Capture Metal Surface</button>
-<div class="ocr-result" id="ocr2">Complete step 1 first</div>
-
-<div class="manual-input-wrap" id="manual2">
-  <!-- Accept formatted input with separator: e.g. "AB12-34567X-CD" -->
-  <input class="manual-input" id="manualInput2" maxlength="14"
-         placeholder="e.g. AB12-34567X-CD" oninput="sanitizeMetalInput(this)">
-  <button class="manual-confirm-btn" onclick="confirmManual(2)">Set</button>
-</div>
-
-<div class="part-display empty" id="partDisplay2">— — — — — — — — — —</div>
-<div class="format-hint">Metal: XXXX–XXXXX[X]–XX (4 · 5–6 · 2 chars)</div>
-
-<button class="retake-btn" id="retake2" onclick="retakeStep(2)">↺ Retake</button>
-```
-
+    <div class="camera-container" id="cam2wrap">
+      <video id="video2" autoplay playsinline muted></video>
+      <canvas class="preview" id="preview2"></canvas>
+      <div class="viewfinder"><span></span></div>
+      <div class="scan-line"></div>
+    </div>
+    <button class="capture-btn" id="captureBtn2" onclick="captureStep(2)" disabled>📷 Capture Metal Surface</button>
+    <div class="ocr-result" id="ocr2">Complete step 1 first</div>
+    <div class="manual-input-wrap" id="manual2">
+      <input class="manual-input" id="manualInput2" maxlength="14"
+             placeholder="e.g. AB12-34567X-CD" oninput="sanitizeMetalInput(this)">
+      <button class="manual-confirm-btn" onclick="confirmManual(2)">Set</button>
+    </div>
+    <div class="part-display empty" id="partDisplay2">— — — — — — — — — —</div>
+    <div class="format-hint">Metal: XXXX–XXXXX[X]–XX  (4 · 5–6 · 2 chars)</div>
+    <button class="retake-btn" id="retake2" onclick="retakeStep(2)">↺ Retake</button>
   </div>
 
-  <!-- ── STEP 3: Barcode / QR label ────────────────────────────────────
-       Scan the barcode or QR code.
-       Value should match the paper part number (same 10–11 char format).
-       Uses native BarcodeDetector API first (fast, offline),
-       then falls back to Claude Vision or Tesseract.                    -->
+  <!-- STEP 3: Barcode -->
 
   <div class="card" id="card3">
     <div class="step-label">Step 3 / 3</div>
     <h2>Barcode Scan <span class="badge badge-pending" id="badge3">Pending</span></h2>
-
-```
-<div class="camera-container" id="cam3wrap">
-  <video id="video3" autoplay playsinline muted></video>
-  <canvas class="preview" id="preview3"></canvas>
-  <div class="viewfinder"><span></span></div>
-  <div class="scan-line"></div>
-</div>
-
-<button class="capture-btn" id="captureBtn3" onclick="captureStep(3)" disabled>📷 Capture Barcode</button>
-<div class="ocr-result" id="ocr3">Complete steps 1 &amp; 2 first</div>
-
-<div class="manual-input-wrap" id="manual3">
-  <input class="manual-input" id="manualInput3" maxlength="11"
-         placeholder="e.g. AB12CD34EF5" oninput="sanitizePartInput(this)">
-  <button class="manual-confirm-btn" onclick="confirmManual(3)">Set</button>
-</div>
-
-<div class="part-display empty" id="partDisplay3">— — — — — — — — — —</div>
-<div class="format-hint">Barcode: 10–11 alphanumeric characters</div>
-
-<button class="retake-btn" id="retake3" onclick="retakeStep(3)">↺ Retake</button>
-```
-
+    <div class="camera-container" id="cam3wrap">
+      <video id="video3" autoplay playsinline muted></video>
+      <canvas class="preview" id="preview3"></canvas>
+      <div class="viewfinder"><span></span></div>
+      <div class="scan-line"></div>
+    </div>
+    <button class="capture-btn" id="captureBtn3" onclick="captureStep(3)" disabled>📷 Capture Barcode</button>
+    <div class="ocr-result" id="ocr3">Complete steps 1 &amp; 2 first</div>
+    <div class="manual-input-wrap" id="manual3">
+      <input class="manual-input" id="manualInput3" maxlength="11"
+             placeholder="e.g. AB12CD34EF5" oninput="sanitizePartInput(this)">
+      <button class="manual-confirm-btn" onclick="confirmManual(3)">Set</button>
+    </div>
+    <div class="part-display empty" id="partDisplay3">— — — — — — — — — —</div>
+    <div class="format-hint">Barcode: 10–11 alphanumeric characters</div>
+    <button class="retake-btn" id="retake3" onclick="retakeStep(3)">↺ Retake</button>
   </div>
 
-  <!-- ── COMPARISON CARD ───────────────────────────────────────────────
-       Shown after all 3 captures, displays two vs-rows:
-         Paper  vs  Metal
-         Metal  vs  Barcode
-       All values normalised (no separators) before comparison.          -->
+  <!-- COMPARISON CARD -->
 
   <div class="card" id="compareCard" style="display:none">
     <div class="step-label">Result Breakdown</div>
@@ -591,17 +455,14 @@
     </div>
   </div>
 
-  <!-- ── STATUS BANNER ─────────────────────────────────────────────────
-       Giant OK (green) or NOK (red) result.
-       Appears with a spring-scale animation.                            -->
+  <!-- STATUS BANNER -->
 
   <div class="status-banner" id="statusBanner">
     <div class="status-big" id="statusText">OK</div>
     <div class="status-sub" id="statusSub"></div>
   </div>
 
-  <!-- ── THUMBNAIL STRIP ───────────────────────────────────────────────
-       Small previews of the 3 captured images.                         -->
+  <!-- THUMBNAILS -->
 
   <div class="thumb-strip" id="thumbStrip">
     <img class="thumb" id="thumb1" alt="Paper">
@@ -609,609 +470,363 @@
     <img class="thumb" id="thumb3" alt="Barcode">
   </div>
 
-  <!-- Folder name shown after finalise() -->
+  <!-- DEBUG PANEL (triple-tap title or auto-shown on failure) -->
+
+  <div id="debugPanel">
+    <div class="debug-title">🔬 Debug — preprocessed crop sent to Tesseract</div>
+    <div id="debugImgs"></div>
+  </div>
 
   <div class="saved-info" id="savedInfo"></div>
-
-  <!-- Download ZIP button (visible after finalise) -->
-
-<button class="dl-btn"    id="dlBtn"    onclick="downloadPackage()">⬇ Download Images (ZIP)</button>
-
-  <!-- Reset to start a new inspection -->
-
-<button class="reset-btn" id="resetBtn" onclick="resetAll()">↺ New Inspection</button>
+  <button class="dl-btn"    id="dlBtn"    onclick="downloadPackage()">⬇ Download Images (ZIP)</button>
+  <button class="reset-btn" id="resetBtn" onclick="resetAll()">↺ New Inspection</button>
 
 </main>
 
-<!-- Off-screen canvas for video snapshots (never shown to user) -->
+<!-- Off-screen snapshot canvas — never displayed -->
 
 <canvas class="hidden" id="captureCanvas"></canvas>
 
-<!-- ═══════════════════════════════════════════════════════════════════════
-     EXTERNAL LIBRARIES
-     Both are cached by the service worker for offline use.
-     ════════════════════════════════════════════════════════════════════ -->
-
-<!-- JSZip: creates the downloadable ZIP containing the 3 images -->
+<!-- JSZip: ZIP packaging for download -->
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 
-<!-- Tesseract.js: offline OCR fallback (WASM-based, runs in-browser) -->
+<!-- Tesseract.js: in-browser OCR (WASM + English language data) -->
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/4.1.2/tesseract.min.js"></script>
 
 <script>
 // ═══════════════════════════════════════════════════════════════════════════
-//  APPLICATION STATE
-//  Single object holding all mutable runtime data.
-//  Keeping it centralised makes reset() simple and avoids global variable
-//  sprawl.
+//  VIEWFINDER CONSTANTS
+//  These MUST match the CSS .viewfinder width/height percentages exactly.
+//  If you change the CSS, update these too.
+//
+//  VF_W = viewfinder width  as fraction of the displayed camera box width
+//  VF_H = viewfinder height as fraction of the displayed camera box height
+// ═══════════════════════════════════════════════════════════════════════════
+const VF_W = 0.80;   // CSS: width: 80%
+const VF_H = 0.45;   // CSS: height: 45%
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  STATE
 // ═══════════════════════════════════════════════════════════════════════════
 const state = {
-  firstTimestamp: null,          // Date of first capture — used as folder timestamp
-  images: { 1: null, 2: null, 3: null },  // base64 JPEG data-URLs per step
-  values: { 1: null, 2: null, 3: null },  // normalised (no separators) part numbers
-  streams: {},                   // MediaStream references keyed by step number
-  apiKey: localStorage.getItem('partchecker_apikey') || '', // Anthropic API key
-  online: navigator.onLine,      // current connectivity
-  tessWorker: null,              // Tesseract worker instance (created lazily)
-  tessReady: false,              // true once Tesseract is initialised
-  tessLoading: false,            // true while Tesseract is initialising
-  debugMode: false               // true = show preprocessed crop below thumbnails
+  firstTimestamp: null,                         // Date of first capture
+  images: { 1: null, 2: null, 3: null },        // original JPEG data-URLs
+  values: { 1: null, 2: null, 3: null },        // normalised part numbers
+  streams: {},                                  // MediaStream per step
+  tessWorker: null,                             // Tesseract worker instance
+  tessReady: false,                             // true once initialised
+  tessLoading: false,                           // true while initialising
+  debugMode: false                              // true = always show debug panel
 };
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  PART NUMBER VALIDATION & NORMALISATION
-//
-//  Paper / Barcode format:
-//    10–11 alphanumeric characters, no separators.
-//    e.g.  "AB12CD34EF"  or  "1A2B3C4D5E6"
-//
-//  Metal / Steel format (as printed on the part):
-//    Group1 (4 chars) + separator (space | dash) +
-//    Group2 (5 or 6 chars) + separator +
-//    Group3 (2 chars)
-//    e.g.  "AB12-34567X-CD"  or  "1A2B 345678 EF"
-//
-//  stripSeparators() removes spaces and dashes so metal values can be
-//  compared directly against paper/barcode values.
+//  PART NUMBER UTILITIES
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Remove all spaces and dashes from a string.
- * Used to normalise metal part numbers before comparison.
- * @param {string} s
- * @returns {string}
+ * Remove spaces and dashes from a string.
+ * Used to normalise the metal part number before comparison,
+ * since paper and barcode values have no separators.
  */
 function stripSeparators(s) {
   return s.replace(/[\s\-]/g, '');
 }
 
 /**
- * Validate a paper or barcode part number.
- * Accepts 10–11 uppercase alphanumeric characters (no separators).
- * @param {string} s - already uppercased, stripped string
- * @returns {boolean}
- */
-function isValidPaperPN(s) {
-  return /^[A-Z0-9]{10,11}$/.test(s);
-}
-
-/**
- * Validate a metal part number in its formatted form.
- * Pattern: 4 chars + (space|dash) + 5–6 chars + (space|dash) + 2 chars
- * @param {string} s - raw input (may contain separators)
- * @returns {boolean}
- */
-function isValidMetalPN(s) {
-  return /^[A-Z0-9]{4}[\s\-][A-Z0-9]{5,6}[\s\-][A-Z0-9]{2}$/.test(s.toUpperCase());
-}
-
-/**
- * Sanitise a general part number input field (paper / barcode).
- * Strips anything that isn't A-Z or 0-9; auto-uppercases.
- * Called via oninput on text fields.
- * @param {HTMLInputElement} el
+ * Sanitise a paper / barcode input field: uppercase, alphanumeric only.
+ * Called via oninput on manual entry fields.
  */
 function sanitizePartInput(el) {
   el.value = el.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
 }
 
 /**
- * Sanitise a metal part number input field.
- * Allows letters, digits, space, and dash (the two valid separators).
- * Auto-uppercases.
- * @param {HTMLInputElement} el
+ * Sanitise a metal input field: allows letters, digits, spaces, dashes.
  */
 function sanitizeMetalInput(el) {
   el.value = el.value.toUpperCase().replace(/[^A-Z0-9\s\-]/g, '');
 }
 
 /**
- * Try to extract a valid metal part number from an OCR'd string.
- * The OCR engine may return it with various separator characters,
- * surrounding noise, or incorrect characters — this function
- * searches for the pattern within a longer string.
- *
- * Metal pattern:  [A-Z0-9]{4}  SEP  [A-Z0-9]{5,6}  SEP  [A-Z0-9]{2}
- * where SEP is one of: space, dash, slash, dot (OCR often misreads '-' as '.')
- *
- * @param {string} raw - OCR output (will be uppercased internally)
- * @returns {string|null} - stripped value (no separators), or null if not found
+ * Extract a metal part number from raw OCR text.
+ * Looks for pattern: 4 chars + separator + 5–6 chars + separator + 2 chars.
+ * OCR often misreads '-' as '/' or '.' so we accept all four as separators.
+ * Returns the value with separators stripped (for comparison with paper/barcode).
  */
 function extractMetalPN(raw) {
   const s = raw.toUpperCase();
-  // Accept space, dash, slash, or dot as separator (OCR mis-reads)
   const rx = /[A-Z0-9]{4}[\s\-\/\.][A-Z0-9]{5,6}[\s\-\/\.][A-Z0-9]{2}/;
-  const match = s.match(rx);
-  if (match) return stripSeparators(match[0]);
-
-  // Fallback: strip all non-alphanumeric and check bare length 11–12
+  const m  = s.match(rx);
+  if (m) return stripSeparators(m[0]);
+  // Fallback: strip non-alphanumeric and return if length matches 11–12
   const bare = s.replace(/[^A-Z0-9]/g, '');
-  if (bare.length >= 11 && bare.length <= 12) return bare;
-  return null;
+  return (bare.length >= 11 && bare.length <= 12) ? bare : null;
 }
 
 /**
- * Try to extract a valid paper/barcode part number from an OCR'd string.
- * Searches for a 10–11 char alphanumeric sequence.
- *
- * @param {string} raw - OCR output
- * @returns {string|null}
+ * Extract a paper / barcode part number from raw OCR text.
+ * Looks for a 10–11 character alphanumeric sequence.
  */
 function extractPaperPN(raw) {
   const s = raw.toUpperCase().replace(/[^A-Z0-9]/g, '');
-  // Prefer exact length matches
-  const match = s.match(/[A-Z0-9]{10,11}/);
-  return match ? match[0] : null;
+  const m = s.match(/[A-Z0-9]{10,11}/);
+  return m ? m[0] : null;
 }
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  CONNECTIVITY UI
-//  Updates the header pill and engine banner whenever online status changes.
+//  TESSERACT OCR ENGINE
+//
+//  Tesseract.js ships pre-trained on a large corpus of printed English text
+//  (books, documents, newspapers — the "tessdata-best" or "tessdata-fast"
+//  models).  It does NOT have specific training for industrial stamped or
+//  engraved fonts.  We compensate with:
+//
+//    • tessedit_char_whitelist — only the characters that appear in our
+//      part numbers, drastically reducing false readings
+//    • tessedit_pageseg_mode   — tuned per step:
+//        PSM 7 = single text LINE  (paper label, one clean line)
+//        PSM 8 = single WORD       (metal stamp, may be one block)
+//        PSM 6 = uniform block     (barcode text, single block)
+//    • Image preprocessing     — see cropToViewfinder / preprocessImage
+//      below; good contrast and sharpness are the single biggest factor
+//      for Tesseract accuracy on industrial text
+//
+//  The Tesseract WASM binary and eng.traineddata language file are fetched
+//  from a CDN on first use and then cached by the service worker, so
+//  subsequent uses are fully offline.
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** Refresh the header connectivity pill and engine banner text/class. */
-function updateConnUI() {
-  const pill  = document.getElementById('connPill');
-  const label = document.getElementById('connLabel');
-  const eng   = document.getElementById('engineBanner');
-
-  if (state.online) {
-    pill.className = 'online';
-    label.textContent = state.apiKey ? 'Online · AI' : 'Online · OCR';
-    if (state.apiKey) {
-      eng.className = 'online';
-      eng.textContent = '⚡ Claude Vision active — high-accuracy AI recognition';
-    } else {
-      eng.className = 'offline';
-      eng.textContent = '⚠ No API key — using Tesseract OCR. Add key above for higher accuracy.';
-    }
-  } else {
-    // Offline
-    pill.className = 'offline';
-    label.textContent = 'Offline · OCR';
-    if (state.tessReady) {
-      eng.className = 'offline';
-      eng.textContent = '📴 Offline mode — Tesseract OCR running on-device';
-    } else if (state.tessLoading) {
-      eng.className = 'loading';
-      eng.textContent = '⏳ Loading offline OCR engine…';
-    } else {
-      eng.className = 'offline';
-      eng.textContent = '⚠ Offline & OCR not ready — use manual entry if needed';
-    }
-  }
+/** Update the engine status banner text and colour class. */
+function setEngineBanner(cls, text) {
+  const el = document.getElementById('engineBanner');
+  el.className = cls;
+  el.textContent = text;
 }
-
-// Listen for browser connectivity events
-window.addEventListener('online',  () => { state.online = true;  updateConnUI(); });
-window.addEventListener('offline', () => { state.online = false; updateConnUI(); });
-
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  API KEY MANAGEMENT
-// ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Called when user clicks "Save Key".
- * Stores the key in localStorage and hides the banner.
- */
-function saveApiKey() {
-  const val = document.getElementById('apiKeyInput').value.trim();
-  if (!val) return;
-  state.apiKey = val;
-  localStorage.setItem('partchecker_apikey', val);
-  document.getElementById('apiKeyBanner').classList.add('hidden');
-  updateConnUI();
-}
-
-/** Hide the API key banner on load if a key is already stored. */
-function initApiKeyUI() {
-  if (state.apiKey) {
-    document.getElementById('apiKeyBanner').classList.add('hidden');
-  }
-}
-
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  TESSERACT.JS — OFFLINE OCR ENGINE
-//  Initialised lazily (first time it's needed, or pre-warmed on load).
-//  The service worker caches the Tesseract WASM + English language data
-//  so this works without a network connection after first visit.
-// ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * Create and configure the Tesseract worker if not already done.
- * Configures it for uppercase alphanumeric characters only (faster, fewer
- * mis-reads on part numbers).
+ * Create the Tesseract worker and load the English language model.
+ * Called once at page load (pre-warms the worker so first scan is fast).
+ * The worker is kept alive in state.tessWorker for reuse.
  */
 async function initTesseract() {
-  // Guard: don't start twice
   if (state.tessReady || state.tessLoading) return;
   if (typeof Tesseract === 'undefined') {
-    console.warn('Tesseract library not loaded');
-    updateConnUI();
+    setEngineBanner('error', '✗ Tesseract library failed to load — check network');
     return;
   }
 
   state.tessLoading = true;
-  updateConnUI();
+  setEngineBanner('loading', '⏳ Loading OCR engine and language data…');
 
   try {
-    state.tessWorker = await Tesseract.createWorker('eng', 1, { logger: () => {} });
-    await state.tessWorker.setParameters({
-      // Only expect uppercase letters and digits — reduces false readings
-      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -',
-      // PSM 7: treat image as a single text line (best for part numbers)
-      tessedit_pageseg_mode: '7'
+    // OEM 1 = LSTM neural-net mode (most accurate for mixed alpha-numeric)
+    state.tessWorker = await Tesseract.createWorker('eng', 1, {
+      logger: () => {} // suppress progress logs
     });
-    state.tessReady = true;
-  } catch (e) {
-    console.warn('Tesseract init failed:', e);
-  }
 
-  state.tessLoading = false;
-  updateConnUI();
+    // Character whitelist: only what our part numbers can contain.
+    // Narrowing this down is the single most effective tuning for accuracy —
+    // Tesseract will never guess a character outside this set.
+    await state.tessWorker.setParameters({
+      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -'
+    });
+
+    state.tessReady  = true;
+    state.tessLoading = false;
+    setEngineBanner('ready', '✓ Tesseract OCR ready (offline)');
+  } catch (e) {
+    state.tessLoading = false;
+    console.error('Tesseract init failed:', e);
+    setEngineBanner('error', '✗ OCR engine failed to load — manual entry only');
+  }
 }
 
 /**
- * Run Tesseract OCR on a base64 JPEG image.
- * Returns the raw text string (the caller is responsible for extracting
- * the part number pattern from it).
- * @param {string} base64jpeg
+ * Run Tesseract on a PNG data-URL with a step-specific PSM setting.
+ *
+ * PSM (Page Segmentation Mode) tells Tesseract how to interpret the layout:
+ *   7 = treat the entire image as a SINGLE TEXT LINE (best for a clean label)
+ *   8 = treat the entire image as a SINGLE WORD (stamped metal with tight chars)
+ *   6 = assume a single uniform block of text (barcodes / mixed content)
+ *
+ * @param {string} pngDataUrl - preprocessed PNG image (full data-URL)
+ * @param {number} stepNum    - drives PSM selection
  * @returns {Promise<string|null>} raw OCR text, or null on failure
  */
-async function runTesseract(base64jpeg) {
-  if (!state.tessReady) await initTesseract();
-  if (!state.tessWorker) return null;
+async function runTesseract(pngDataUrl, stepNum) {
+  if (!state.tessReady) {
+    await initTesseract();
+    if (!state.tessReady) return null;
+  }
+
+  // Choose PSM per step type
+  const psm = { 1: '7', 2: '8', 3: '6' }[stepNum] || '7';
+
   try {
-    const { data: { text } } = await state.tessWorker.recognize(
-      'data:image/jpeg;base64,' + base64jpeg
-    );
+    // setParameters between recognise calls lets us switch PSM per step
+    await state.tessWorker.setParameters({ tessedit_pageseg_mode: psm });
+    const { data: { text } } = await state.tessWorker.recognize(pngDataUrl);
     return text.trim().toUpperCase() || null;
   } catch (e) {
-    console.warn('Tesseract recognition failed:', e);
+    console.warn('Tesseract recognition error:', e);
     return null;
   }
 }
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  CLAUDE VISION — ONLINE AI ENGINE
-//  Sends the captured JPEG to the Anthropic API with a tailored prompt
-//  for each step type.  Returns the raw extracted string.
-// ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * Send an image to Claude Vision and extract the part number.
- *
- * Prompts are step-specific:
- *   Step 1 (paper)   → 10–11 char alphanumeric, no separators
- *   Step 2 (metal)   → formatted XXXX-XXXXX(X)-XX, separators allowed
- *   Step 3 (barcode) → decode barcode, return 10–11 char value
- *
- * @param {string} base64 - JPEG image data (no data-URL prefix)
- * @param {number} stepNum - 1, 2, or 3
- * @returns {Promise<string|null>} extracted value string, or null
- */
-async function runClaudeVision(base64, stepNum) {
-  if (!state.apiKey) throw new Error('No API key set');
-
-  // ── Step-specific prompts ──────────────────────────────────────────────
-  const prompts = {
-    1: `This image shows a printed paper label with a part number.
-The part number is 10 to 11 alphanumeric characters (letters A-Z and digits 0-9), with no spaces or separators.
-Examples: "AB12CD34EF" or "1A2B3C4D5E6"
-Find and return ONLY the part number. No explanation, no extra text. Just the characters.`,
-
-    2: `This image shows a metal part with a stamped or engraved part number.
-The format is: 4 characters, then a space or dash, then 5 or 6 characters, then a space or dash, then 2 characters.
-All characters are letters (A-Z) or digits (0-9).
-Examples: "AB12-34567X-CD" or "1A2B 345678 EF"
-Return ONLY the part number exactly as printed, keeping the separators (space or dash).
-No explanation, no extra text.`,
-
-    3: `This image contains a barcode or QR code label.
-Decode or read the value shown. It should be 10 to 11 alphanumeric characters (letters A-Z and digits 0-9) with no spaces.
-Examples: "AB12CD34EF" or "1A2B3C4D5E6"
-Return ONLY the raw value. No explanation, no extra text.`
-  };
-
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': state.apiKey,
-      'anthropic-version': '2023-06-01',
-      // Required header for direct browser API access
-      'anthropic-dangerous-direct-browser-access': 'true'
-    },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 60,
-      messages: [{
-        role: 'user',
-        content: [
-          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64 } },
-          { type: 'text',  text: prompts[stepNum] }
-        ]
-      }]
-    })
-  });
-
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `API error ${res.status}`);
-  }
-
-  const data = await res.json();
-  // Extract text from the response content blocks
-  const raw = data.content.map(b => b.text || '').join('').trim().toUpperCase();
-  return raw || null;
-}
-
-
-// ═══════════════════════════════════════════════════════════════════════════
 //  NATIVE BARCODE DETECTOR
-//  The browser's built-in BarcodeDetector API (Chrome/Android).
-//  Fast, works offline, no external dependency.
-//  Returns null if the API isn't available or no barcode is found.
+//  Chrome/Android has a built-in BarcodeDetector API that is fast, accurate,
+//  and works offline.  We try it first for step 3; fall back to Tesseract.
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Attempt to decode a barcode from a live video element using the
- * native BarcodeDetector API.
+ * Attempt to decode a barcode from the live video stream.
+ * Works on the video element directly (no snapshot needed).
  * @param {HTMLVideoElement} video
  * @returns {Promise<string|null>}
  */
 async function tryNativeBarcode(video) {
   if (!('BarcodeDetector' in window)) return null;
   try {
-    const bd = new BarcodeDetector();
+    const bd      = new BarcodeDetector();
     const results = await bd.detect(video);
     if (results.length > 0) {
       return results[0].rawValue.toUpperCase().replace(/[^A-Z0-9]/g, '');
     }
-  } catch (e) {
-    // API available but detection failed — not an error
-  }
+  } catch (e) { /* not an error — barcode just not found */ }
   return null;
-}
-
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  UNIFIED RECOGNITION
-//  Single entry point that picks the best available engine automatically:
-//    1. Native BarcodeDetector (barcode step only — fast & offline)
-//    2. Claude Vision (if online + API key)
-//    3. Tesseract OCR (offline fallback)
-//  Returns { value, engine } where value is the normalised part number.
-// ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * Recognise a part number from a captured image using the best
- * available engine.
- *
- * @param {string} base64    - JPEG image data (no prefix)
- * @param {HTMLVideoElement} video - live video element (for native barcode)
- * @param {number} stepNum   - 1=paper, 2=metal, 3=barcode
- * @returns {Promise<{value:string|null, engine:string}>}
- */
-async function recognise(base64, video, stepNum) {
-
-  // ── Step 3: try native barcode decoder first (fastest, works offline) ──
-  if (stepNum === 3) {
-    const native = await tryNativeBarcode(video);
-    if (native) return { value: native, engine: 'Native BarcodeDetector' };
-  }
-
-  // ── Online + API key: use Claude Vision ───────────────────────────────
-  if (state.online && state.apiKey) {
-    try {
-      const rawText = await runClaudeVision(base64, stepNum);
-      if (rawText) {
-        // Extract and normalise by step type
-        const value = stepNum === 2
-          ? extractMetalPN(rawText)   // metal: strip separators
-          : extractPaperPN(rawText);  // paper/barcode: alphanumeric only
-        return { value, engine: 'Claude Vision AI' };
-      }
-    } catch (e) {
-      // Claude Vision failed — log and fall through to Tesseract
-      console.warn('Claude Vision failed, falling back to Tesseract:', e.message);
-    }
-  }
-
-  // ── Offline or no API key: use Tesseract OCR ──────────────────────────
-  const rawText = await runTesseract(base64);
-  const value = rawText
-    ? (stepNum === 2 ? extractMetalPN(rawText) : extractPaperPN(rawText))
-    : null;
-  return { value, engine: 'Tesseract OCR (offline)' };
-}
-
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  CAMERA MANAGEMENT
-// ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * Start the rear camera for the given step.
- * Requests the highest available resolution for best OCR results.
- * @param {number} n - step number (1, 2, or 3)
- */
-async function startCamera(n) {
-  const video = document.getElementById('video' + n);
-  try {
-    // Stop any existing stream on this step first
-    if (state.streams[n]) state.streams[n].getTracks().forEach(t => t.stop());
-
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: 'environment',   // rear camera
-        width:  { ideal: 1920 },     // high resolution for better OCR
-        height: { ideal: 1080 }
-      },
-      audio: false
-    });
-    state.streams[n] = stream;
-    video.srcObject = stream;
-    video.style.display = 'block';
-    // Hide frozen preview canvas if visible from a previous capture
-    document.getElementById('preview' + n).style.display = 'none';
-  } catch (e) {
-    // Camera permission denied or not available
-    setOcr(n, '⚠ Camera unavailable — enter value manually', 'fail');
-    document.getElementById('manual'     + n).style.display = 'flex';
-    document.getElementById('captureBtn' + n).style.display = 'none';
-  }
-}
-
-/**
- * Stop and release the camera stream for the given step.
- * Called after capture so the camera LED turns off.
- * @param {number} n
- */
-function stopCamera(n) {
-  if (state.streams[n]) {
-    state.streams[n].getTracks().forEach(t => t.stop());
-    delete state.streams[n];
-  }
 }
 
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  IMAGE PREPROCESSING
 //
-//  Raw camera frames often have glare, poor contrast, or uneven lighting
-//  that trips up both AI vision and Tesseract OCR.  We apply a lightweight
-//  pipeline to every captured image BEFORE sending it for recognition:
+//  The root cause of poor Tesseract accuracy on camera images is almost
+//  always one of:
+//    1. The part number is tiny within the full frame  → fix: crop tight
+//    2. Low contrast (dark metal, reflections)         → fix: auto-levels
+//    3. Soft focus or motion blur                      → fix: sharpen
+//    4. JPEG compression artefacts on character edges  → fix: use PNG output
 //
-//    1. CROP     — extract only the viewfinder rectangle (80% × 45% centred)
-//                  so the AI sees a tight close-up, not the whole scene
-//    2. UPSCALE  — scale the crop up to at least 900 px wide so characters
-//                  are large enough for reliable OCR
-//    3. GREYSCALE — convert to greyscale; colour is irrelevant for text and
-//                  reduces JPEG compression artefacts on edges
-//    4. CONTRAST  — auto-levels stretch (min→0, max→255) + mild gamma to
-//                  separate dark text from light backgrounds and vice versa
-//    5. SHARPEN   — 3×3 unsharp-mask kernel to crisp up character edges
+//  THE CROP BUG (now fixed):
+//    The camera produces a 16:9 native frame (e.g. 1920×1080).
+//    The CSS camera box is 4:3 (e.g. displayed at 400×300 px).
+//    CSS object-fit:cover scales the video UP to fill the box and then
+//    HIDES the left and right edges that overflow.
 //
-//  The ORIGINAL full-resolution colour image is still saved to the ZIP.
-//  Only the preprocessed crop is sent to the recognition engine.
+//    So what the user sees inside the 4:3 box is NOT the full 1920-wide
+//    frame — it is the centre 1440×1080 strip (keeping height=1080, then
+//    cutting 240 px from each side of the 1920 width).
+//
+//    The viewfinder bracket is drawn at VF_W=80%, VF_H=45% of the
+//    DISPLAYED box.  To find the matching rectangle in canvas pixels we:
+//      a) Compute the "visible" region of the native frame (the centre strip)
+//      b) Map VF_W/VF_H fractions into that region
+//
+//    This is done in cropToViewfinder() below.
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Crop the viewfinder region from a full video-resolution canvas.
- * The viewfinder CSS overlay is 80% wide × 45% tall, centred.
- * We use the same proportions here so the crop exactly matches what
- * the user sees inside the brackets.
+ * Crop the exact pixels that the viewfinder bracket covers.
  *
- * The crop is also upscaled to a minimum width so OCR engines receive
- * characters that are large enough to read reliably.
+ * The maths accounts for the object-fit:cover scaling:
+ *   - Native frame:  nativeW × nativeH  (from canvas.width/height)
+ *   - Display box:   displayW × displayH (from video.clientWidth/Height)
+ *   - Cover scale:   max(displayW/nativeW, displayH/nativeH)
+ *   - Visible region of native frame after cover-crop:
+ *       visW = displayW / scale   (pixels of native frame that are shown)
+ *       visH = displayH / scale
+ *       offX = (nativeW - visW) / 2   (hidden strip on each side)
+ *       offY = (nativeH - visH) / 2
+ *   - Viewfinder in native pixels:
+ *       vfW = visW × VF_W,  vfH = visH × VF_H
+ *       vfX = offX + (visW - vfW) / 2
+ *       vfY = offY + (visH - vfH) / 2
  *
- * @param {HTMLCanvasElement} srcCanvas - full-frame snapshot canvas
- * @returns {HTMLCanvasElement} new canvas containing just the crop
+ * @param {HTMLCanvasElement} srcCanvas - full native-resolution snapshot
+ * @param {HTMLVideoElement}  video     - the source video element (for display size)
+ * @returns {HTMLCanvasElement} new canvas with just the viewfinder region
  */
-function cropToViewfinder(srcCanvas) {
-  const W = srcCanvas.width;
-  const H = srcCanvas.height;
+function cropToViewfinder(srcCanvas, video) {
+  const nativeW  = srcCanvas.width;
+  const nativeH  = srcCanvas.height;
 
-  // Match CSS viewfinder proportions: 80% wide, 45% tall, centred
-  const cropW = Math.round(W * 0.80);
-  const cropH = Math.round(H * 0.45);
-  const cropX = Math.round((W - cropW) / 2);
-  const cropY = Math.round((H - cropH) / 2);
+  // Displayed size of the video element in CSS pixels
+  const displayW = video.clientWidth  || nativeW;
+  const displayH = video.clientHeight || nativeH;
 
-  // Upscale if the crop is narrower than MIN_WIDTH (common on low-res cameras)
+  // object-fit:cover scale factor — whichever axis fills first
+  const scale = Math.max(displayW / nativeW, displayH / nativeH);
+
+  // Size of the native frame that is actually visible through the CSS box
+  const visW = displayW / scale;
+  const visH = displayH / scale;
+
+  // Top-left corner of the visible region in native pixel coordinates
+  const offX = (nativeW - visW) / 2;
+  const offY = (nativeH - visH) / 2;
+
+  // Viewfinder rectangle in native pixel coordinates
+  const vfW = visW * VF_W;
+  const vfH = visH * VF_H;
+  const vfX = offX + (visW - vfW) / 2;
+  const vfY = offY + (visH - vfH) / 2;
+
+  // Upscale to MIN_WIDTH for OCR legibility if the crop is small
   const MIN_WIDTH = 900;
-  const scale     = cropW < MIN_WIDTH ? MIN_WIDTH / cropW : 1;
-  const outW      = Math.round(cropW * scale);
-  const outH      = Math.round(cropH * scale);
+  const upscale   = vfW < MIN_WIDTH ? MIN_WIDTH / vfW : 1;
+  const outW      = Math.round(vfW * upscale);
+  const outH      = Math.round(vfH * upscale);
 
   const out = document.createElement('canvas');
   out.width  = outW;
   out.height = outH;
   const ctx  = out.getContext('2d');
-
-  // High-quality bicubic-style interpolation when upscaling
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(srcCanvas, cropX, cropY, cropW, cropH, 0, 0, outW, outH);
+  ctx.drawImage(srcCanvas, vfX, vfY, vfW, vfH, 0, 0, outW, outH);
   return out;
 }
 
 /**
- * Convert a canvas to greyscale in-place using perceptual luminance weights.
- * Greyscale:  eliminates colour cast that can fool contrast stretching,
- *             reduces chroma noise, and makes subsequent operations faster.
- * @param {HTMLCanvasElement} canvas - modified in-place
+ * Convert a canvas to greyscale in-place (ITU-R BT.601 luminance weights).
+ * Greyscale removes colour noise and makes contrast stretching more reliable.
  */
 function applyGreyscale(canvas) {
   const ctx  = canvas.getContext('2d');
   const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const px   = data.data;
   for (let i = 0; i < px.length; i += 4) {
-    // ITU-R BT.601 luminance weights
-    const lum = px[i] * 0.299 + px[i+1] * 0.587 + px[i+2] * 0.114;
+    const lum    = px[i] * 0.299 + px[i+1] * 0.587 + px[i+2] * 0.114;
     px[i] = px[i+1] = px[i+2] = lum;
-    // alpha unchanged
   }
   ctx.putImageData(data, 0, 0);
 }
 
 /**
- * Auto-levels contrast stretch + mild gamma correction.
- *
- * Pass 1: find the actual min and max pixel values in the crop.
- * Pass 2: remap so the darkest pixel → 0 and the brightest → 255,
- *         then apply gamma = 0.85 (lifts midtones slightly, helps with
- *         darker-than-expected industrial markings).
- *
- * Works on greyscale (R=G=B) images; calling on colour has no ill effect.
- * @param {HTMLCanvasElement} canvas - modified in-place
+ * Auto-levels contrast stretch + mild gamma lift.
+ * Remaps darkest pixel → 0, brightest → 255, then gamma=0.85 lifts midtones.
+ * This turns "dark stamped text on darker metal" into readable black-on-white.
  */
 function applyContrast(canvas) {
   const ctx  = canvas.getContext('2d');
   const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const px   = data.data;
-
-  // Pass 1 — find dynamic range
   let lo = 255, hi = 0;
   for (let i = 0; i < px.length; i += 4) {
     if (px[i] < lo) lo = px[i];
     if (px[i] > hi) hi = px[i];
   }
-  const range = (hi - lo) || 1; // guard against uniform image
-
-  // Pass 2 — stretch + gamma
+  const range = (hi - lo) || 1;
   const gamma = 0.85;
   for (let i = 0; i < px.length; i += 4) {
-    let v   = (px[i] - lo) / range;           // normalise → [0, 1]
-    v       = Math.pow(v, gamma);              // gamma curve
+    let v = (px[i] - lo) / range;
+    v     = Math.pow(v, gamma);
     const o = Math.min(255, Math.round(v * 255));
     px[i] = px[i+1] = px[i+2] = o;
   }
@@ -1219,146 +834,97 @@ function applyContrast(canvas) {
 }
 
 /**
- * Apply a 3×3 unsharp-mask (sharpening) convolution.
- *
- * Kernel:   [ 0, -1,  0 ]
- *           [-1,  5, -1 ]
- *           [ 0, -1,  0 ]
- *
- * This emphasises character edges (vertical and horizontal strokes)
- * without amplifying diagonal noise or specular highlights.
- * Edge pixels (1-pixel border) are copied unmodified.
- *
- * @param {HTMLCanvasElement} canvas - modified in-place
+ * 3×3 unsharp-mask kernel: sharpens character edges.
+ * [ 0,-1, 0]
+ * [-1, 5,-1]
+ * [ 0,-1, 0]
  */
 function applySharpen(canvas) {
   const ctx = canvas.getContext('2d');
-  const W   = canvas.width;
-  const H   = canvas.height;
+  const W = canvas.width, H = canvas.height;
   const src = ctx.getImageData(0, 0, W, H);
   const dst = ctx.createImageData(W, H);
-  const s   = src.data;
-  const d   = dst.data;
-
+  const s = src.data, d = dst.data;
   for (let y = 1; y < H - 1; y++) {
     for (let x = 1; x < W - 1; x++) {
       const i = (y * W + x) * 4;
       for (let c = 0; c < 3; c++) {
-        // Centre weight 5, orthogonal neighbours −1
-        const val =
-            5 * s[i + c]
-          - 1 * s[i - W*4 + c]   // top
-          - 1 * s[i + W*4 + c]   // bottom
-          - 1 * s[i - 4   + c]   // left
-          - 1 * s[i + 4   + c];  // right
-        d[i + c] = Math.min(255, Math.max(0, val));
+        const v = 5*s[i+c] - s[i-W*4+c] - s[i+W*4+c] - s[i-4+c] - s[i+4+c];
+        d[i+c] = Math.min(255, Math.max(0, v));
       }
-      d[i + 3] = 255; // fully opaque
+      d[i+3] = 255;
     }
   }
-  // Copy unprocessed border pixels from source
   ctx.putImageData(dst, 0, 0);
 }
 
 /**
- * Full preprocessing pipeline: crop → greyscale → contrast → sharpen.
+ * Full preprocessing pipeline.
+ * Returns the processed PNG data-URL (sent to Tesseract) plus the base64
+ * string without prefix.
+ * The original colour snapshot is stored separately for the ZIP archive.
  *
- * Returns both the base64 PNG string (sent to AI) and the data-URL
- * (used by the debug panel).  PNG is used instead of JPEG so there
- * are no block-artefacts around character edges.
- *
- * @param {HTMLCanvasElement} fullCanvas - full-resolution snapshot
- * @param {number} stepNum               - 1=paper, 2=metal, 3=barcode
- * @returns {{ processedBase64: string, processedDataUrl: string }}
+ * @param {HTMLCanvasElement} fullCanvas
+ * @param {HTMLVideoElement}  video       - needed for correct crop mapping
+ * @param {number}            stepNum
+ * @returns {{ pngDataUrl: string }}
  */
-function preprocessImage(fullCanvas, stepNum) {
-  // Step 1: crop to viewfinder area
-  const cropped = cropToViewfinder(fullCanvas);
+function preprocessImage(fullCanvas, video, stepNum) {
+  // 1. Crop to exact viewfinder area (with cover-scaling correction)
+  const cropped = cropToViewfinder(fullCanvas, video);
 
-  // Step 2: greyscale (skip for barcode — colour can help native detector)
+  // 2. Greyscale (skip for barcode — colour helps native BarcodeDetector)
   if (stepNum !== 3) applyGreyscale(cropped);
 
-  // Step 3: auto-levels contrast
+  // 3. Auto-levels contrast
   applyContrast(cropped);
 
-  // Step 4: sharpen edges
+  // 4. Sharpen edges
   applySharpen(cropped);
 
-  // Export as lossless PNG — no JPEG artefacts on text edges
-  const processedDataUrl = cropped.toDataURL('image/png');
-  const processedBase64  = processedDataUrl.split(',')[1];
-
-  // Show in debug panel if enabled
-  if (state.debugMode) showDebugImage(processedDataUrl, stepNum);
-
-  return { processedBase64, processedDataUrl };
+  // 5. Export as lossless PNG — no JPEG artefacts on character edges
+  const pngDataUrl = cropped.toDataURL('image/png');
+  return { pngDataUrl };
 }
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  DEBUG MODE
+//  DEBUG PANEL
 //
-//  Shows the exact preprocessed image that gets sent to the recognition
-//  engine — useful for diagnosing failures without needing DevTools.
+//  Shows the exact preprocessed image Tesseract receives, so failures can
+//  be diagnosed without DevTools.
 //
-//  ACTIVATION: tap the header title (⬡ Part Checker) 3× in quick
-//  succession.  A toast confirms the toggle.  The panel also appears
-//  automatically on any recognition failure so you can see what the AI saw.
+//  Activation:
+//    • Triple-tap the header title → toggles debug mode (all steps shown)
+//    • Automatically shown on any recognition failure
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Render a preprocessed image in a debug panel below the thumbnails.
- * The panel is created on first call and reused thereafter.
- * @param {string} dataUrl  - PNG data-URL of the preprocessed crop
- * @param {number} stepNum  - which step this image belongs to
+ * Show (or update) a step's preprocessed image in the debug panel.
+ * @param {string} pngDataUrl
+ * @param {number} stepNum
  */
-function showDebugImage(dataUrl, stepNum) {
-  // Create the panel container if it doesn't exist yet
-  let panel = document.getElementById('debugPanel');
-  if (!panel) {
-    panel = document.createElement('div');
-    panel.id = 'debugPanel';
-    panel.style.cssText = [
-      'background:#0a0a0a',
-      'border:1px dashed #333',
-      'border-radius:4px',
-      'padding:12px',
-      'margin-top:4px'
-    ].join(';');
-    panel.innerHTML = `
-      <div style="font-family:var(--mono);font-size:0.65rem;color:#555;
-                  letter-spacing:.1em;text-transform:uppercase;margin-bottom:8px">
-        🔬 Debug — preprocessed crop sent to AI
-      </div>
-      <div id="debugImgs" style="display:flex;gap:8px;flex-wrap:wrap"></div>
-    `;
-    // Insert right after the thumbnail strip
-    const strip = document.getElementById('thumbStrip');
-    strip.parentNode.insertBefore(panel, strip.nextSibling);
-  }
+function showDebugImage(pngDataUrl, stepNum) {
+  const panel = document.getElementById('debugPanel');
+  panel.classList.add('visible');
 
-  // Replace image for this step if already shown
   const container = document.getElementById('debugImgs');
-  const existing  = container.querySelector(`[data-step="${stepNum}"]`);
-  if (existing) existing.remove();
+  // Replace previous image for this step if present
+  const old = container.querySelector(`[data-step="${stepNum}"]`);
+  if (old) old.remove();
 
   const wrap = document.createElement('div');
+  wrap.className = 'debug-img-wrap';
   wrap.setAttribute('data-step', stepNum);
-  wrap.style.cssText = 'flex:1;min-width:80px';
   wrap.innerHTML = `
-    <div style="font-family:var(--mono);font-size:0.6rem;color:#555;margin-bottom:4px">
-      Step ${stepNum}
-    </div>
-    <img src="${dataUrl}"
-         style="width:100%;border:1px solid #222;border-radius:2px;display:block">
+    <div class="debug-step-label">Step ${stepNum}</div>
+    <img src="${pngDataUrl}" alt="step ${stepNum} preprocessed">
   `;
   container.appendChild(wrap);
 }
 
-// ── Triple-tap the header title to toggle debug mode ──────────────────────
-// Uses a short 500 ms window: three taps within 500 ms = toggle.
-let _tapCount = 0;
-let _tapTimer = null;
+// Triple-tap the title to toggle persistent debug mode
+let _tapCount = 0, _tapTimer = null;
 document.addEventListener('DOMContentLoaded', () => {
   document.querySelector('header h1').addEventListener('click', () => {
     _tapCount++;
@@ -1366,23 +932,17 @@ document.addEventListener('DOMContentLoaded', () => {
     _tapTimer = setTimeout(() => {
       if (_tapCount >= 3) {
         state.debugMode = !state.debugMode;
-        // Brief floating toast
         const toast = document.createElement('div');
         toast.textContent = state.debugMode ? '🔬 Debug ON' : '🔬 Debug OFF';
-        toast.style.cssText = [
-          'position:fixed', 'top:56px', 'left:50%', 'transform:translateX(-50%)',
-          'background:#1a1a1a', 'color:var(--accent)',
-          'font-family:var(--mono)', 'font-size:.75rem',
-          'padding:6px 18px', 'border-radius:20px',
-          'z-index:999', 'pointer-events:none',
-          'border:1px solid var(--accent)'
-        ].join(';');
+        toast.style.cssText = `position:fixed;top:56px;left:50%;transform:translateX(-50%);
+          background:#1a1a1a;color:var(--accent);font-family:var(--mono);
+          font-size:.75rem;padding:6px 18px;border-radius:20px;z-index:999;
+          pointer-events:none;border:1px solid var(--accent)`;
         document.body.appendChild(toast);
         setTimeout(() => toast.remove(), 1800);
-        // Remove the debug panel when turning off
         if (!state.debugMode) {
-          const p = document.getElementById('debugPanel');
-          if (p) p.remove();
+          document.getElementById('debugPanel').classList.remove('visible');
+          document.getElementById('debugImgs').innerHTML = '';
         }
       }
       _tapCount = 0;
@@ -1392,21 +952,64 @@ document.addEventListener('DOMContentLoaded', () => {
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  CAPTURE FLOW
-//  Main action when the user taps a "Capture" button.
-//
-//  Pipeline:
-//    1. Snapshot the live video at full native camera resolution
-//    2. Apply preprocessing: crop viewfinder → greyscale → contrast → sharpen
-//    3. Freeze the camera preview (shows the original colour image)
-//    4. Send the PREPROCESSED PNG crop to the recognition engine
-//    5. On success: show value and advance to next step
-//    6. On failure: show manual entry + auto-open debug panel
+//  CAMERA MANAGEMENT
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Capture → preprocess → recognise → update UI.
- * @param {number} n - step number (1, 2, or 3)
+ * Start the rear camera for a given step.
+ * We request 4:3 natively to avoid the cover-crop problem where possible,
+ * but fall back gracefully if the device only supports 16:9.
+ */
+async function startCamera(n) {
+  const video = document.getElementById('video' + n);
+  try {
+    if (state.streams[n]) state.streams[n].getTracks().forEach(t => t.stop());
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: 'environment',
+        // Prefer 4:3 so native frame matches the CSS box — eliminates
+        // the cover-crop mismatch for devices that support it.
+        // Most modern phones will honour this or get close.
+        aspectRatio: { ideal: 4/3 },
+        width:  { ideal: 1280 },
+        height: { ideal: 960 }
+      },
+      audio: false
+    });
+    state.streams[n] = stream;
+    video.srcObject  = stream;
+    video.style.display = 'block';
+    document.getElementById('preview' + n).style.display = 'none';
+  } catch (e) {
+    console.warn('Camera error:', e);
+    setOcr(n, '⚠ Camera unavailable — enter value manually', 'fail');
+    document.getElementById('manual'     + n).style.display = 'flex';
+    document.getElementById('captureBtn' + n).style.display = 'none';
+  }
+}
+
+/** Stop and release a camera stream. */
+function stopCamera(n) {
+  if (state.streams[n]) {
+    state.streams[n].getTracks().forEach(t => t.stop());
+    delete state.streams[n];
+  }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  CAPTURE FLOW
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Main capture handler:
+ *   1. Snapshot at native camera resolution
+ *   2. Preprocess (crop-to-viewfinder with cover correction, greyscale,
+ *      contrast, sharpen)
+ *   3. Freeze preview with original colour image
+ *   4. Run recognition (native barcode for step 3, else Tesseract)
+ *   5. Update UI — advance on success, show manual entry + debug on failure
  */
 async function captureStep(n) {
   const video   = document.getElementById('video'      + n);
@@ -1415,128 +1018,122 @@ async function captureStep(n) {
   const camWrap = document.getElementById('cam'        + n + 'wrap');
   const canvas  = document.getElementById('captureCanvas');
 
-  // If camera permission was denied, fall back to manual entry immediately
   if (!video.srcObject) {
     document.getElementById('manual' + n).style.display = 'flex';
     return;
   }
 
-  // ── Disable button + show scan-line animation ──────────────────────────
   btn.disabled    = true;
   btn.textContent = '⏳ Processing…';
   camWrap.classList.add('scanning');
 
-  // ── Snapshot at the actual camera sensor resolution ────────────────────
-  // video.videoWidth/Height reflects the negotiated camera resolution,
-  // but track.getSettings() can give the real hardware resolution on
-  // some browsers (higher quality, better OCR).
+  // ── Full-resolution snapshot ───────────────────────────────────────────
+  // Use track settings for the true hardware resolution — more reliable
+  // than video.videoWidth which can reflect the CSS display size on some browsers.
   const track    = video.srcObject?.getVideoTracks()[0];
   const settings = track ? track.getSettings() : {};
   canvas.width   = settings.width  || video.videoWidth  || 1280;
-  canvas.height  = settings.height || video.videoHeight || 720;
+  canvas.height  = settings.height || video.videoHeight || 960;
   canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
 
-  // ── Save original colour image for ZIP (before preprocessing) ─────────
+  // Keep the original colour image for the ZIP
   const originalDataUrl = canvas.toDataURL('image/jpeg', 0.95);
 
-  // ── Preprocess: crop → greyscale → contrast → sharpen ─────────────────
-  // Yield to the browser event loop first so the scan animation renders
-  setOcr(n, `<span class="spinner"></span>&nbsp;Preprocessing…`, 'thinking');
+  // ── Preprocess (yield first so scan animation renders) ─────────────────
+  setOcr(n, `<span class="spinner"></span>&nbsp;Preprocessing image…`, 'thinking');
   await new Promise(r => setTimeout(r, 15));
-  const { processedBase64, processedDataUrl } = preprocessImage(canvas, n);
+  const { pngDataUrl } = preprocessImage(canvas, video, n);
 
-  // ── Freeze preview (shows original colour image, not the grey crop) ────
+  // ── Freeze preview with original colour photo ──────────────────────────
   const pctx = preview.getContext('2d');
-  preview.width  = canvas.width;
-  preview.height = canvas.height;
+  preview.width = canvas.width; preview.height = canvas.height;
   pctx.drawImage(canvas, 0, 0);
   preview.style.display = 'block';
   video.style.display   = 'none';
   camWrap.classList.remove('scanning');
-
-  // Release camera stream — LED turns off, battery is preserved
   stopCamera(n);
 
-  // ── Record timestamp of the very first capture in this session ─────────
   if (!state.firstTimestamp && n === 1) state.firstTimestamp = new Date();
 
-  // ── Store original image + update thumbnail strip ──────────────────────
+  // Store original + show thumbnail
   state.images[n] = originalDataUrl;
-  const thumb     = document.getElementById('thumb' + n);
-  thumb.src = originalDataUrl;
-  thumb.classList.add('visible');
+  document.getElementById('thumb' + n).src = originalDataUrl;
+  document.getElementById('thumb' + n).classList.add('visible');
   document.getElementById('thumbStrip').style.display = 'flex';
 
-  // ── Kick off recognition on the PREPROCESSED crop ─────────────────────
-  const engineHint = (state.online && state.apiKey) ? 'Claude AI' : 'Tesseract OCR';
-  setOcr(n, `<span class="spinner"></span>&nbsp;Analysing with ${engineHint}…`, 'thinking');
+  // Show debug image if debug mode is on
+  if (state.debugMode) showDebugImage(pngDataUrl, n);
 
-  let result;
-  try {
-    result = await recognise(processedBase64, video, n);
-  } catch (e) {
-    // Unrecoverable error in the recognition pipeline (e.g. network failure)
-    setOcr(n, '⚠ ' + e.message + ' — enter manually', 'fail');
-    document.getElementById('manual' + n).style.display = 'flex';
-    btn.textContent = '📷 Re-capture';
-    btn.disabled    = false;
-    return;
+  // ── Recognition ────────────────────────────────────────────────────────
+  setOcr(n, `<span class="spinner"></span>&nbsp;Reading with Tesseract OCR…`, 'thinking');
+
+  let value = null;
+
+  // Step 3: try native barcode decoder first (fast, very reliable, offline)
+  if (n === 3) {
+    value = await tryNativeBarcode(video);
+    if (value) {
+      finishStep(n, value, 'Native BarcodeDetector');
+      return;
+    }
   }
 
-  const { value, engine } = result;
+  // Tesseract OCR on the preprocessed PNG
+  const rawText = await runTesseract(pngDataUrl, n);
+  if (rawText) {
+    value = n === 2 ? extractMetalPN(rawText) : extractPaperPN(rawText);
+  }
 
   if (value) {
-    // ── Recognition succeeded ───────────────────────────────────────────
-    setOcr(n,
-      `✓ <em style="opacity:.55">${engine}:</em> <strong style="color:var(--ok)">${value}</strong>`,
-      'success'
-    );
-    setValue(n, value);
-    document.getElementById('badge'  + n).textContent = 'Done';
-    document.getElementById('badge'  + n).className   = 'badge badge-done';
-    document.getElementById('retake' + n).style.display = 'inline-block';
-    btn.style.display = 'none';
-    document.getElementById('manual' + n).style.display = 'none';
-    advanceStep(n);
-
+    finishStep(n, value, 'Tesseract OCR');
   } else {
-    // ── Recognition failed — show debug image automatically ─────────────
-    // This lets the user immediately see what the AI received without
-    // needing to enable debug mode manually.
-    setOcr(n,
-      `⚠ Could not read — see debug image below or enter manually`,
-      'fail'
-    );
+    // Failed — always show debug image so user can see what Tesseract received
+    setOcr(n, `⚠ Could not read — check debug image below or enter manually`, 'fail');
     document.getElementById('manual' + n).style.display = 'flex';
     btn.textContent = '📷 Re-capture';
     btn.disabled    = false;
-
-    // Always show the preprocessed crop on failure so the user can judge
-    // whether the image quality / framing needs to be improved
-    showDebugImage(processedDataUrl, n);
+    showDebugImage(pngDataUrl, n);  // auto-show on failure even without debug mode
   }
 }
 
+/**
+ * Shared success handler: update UI and advance to next step.
+ * @param {number} n       - step number
+ * @param {string} value   - recognised value (already normalised)
+ * @param {string} engine  - engine name for display
+ */
+function finishStep(n, value, engine) {
+  setOcr(n,
+    `✓ <em style="opacity:.55">${engine}:</em> <strong style="color:var(--ok)">${value}</strong>`,
+    'success'
+  );
+  setValue(n, value);
+  document.getElementById('badge'  + n).textContent = 'Done';
+  document.getElementById('badge'  + n).className   = 'badge badge-done';
+  document.getElementById('retake' + n).style.display = 'inline-block';
+  document.getElementById('captureBtn' + n).style.display = 'none';
+  document.getElementById('manual' + n).style.display = 'none';
+  advanceStep(n);
+}
+
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  MANUAL ENTRY
-//  Activated when OCR fails or camera is unavailable.
-//  Grabs a snapshot from the current video frame if possible,
-//  so we still have an image to save in the ZIP.
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Confirm the manually typed part number for step n.
- * Also attempts to grab a camera frame if no image was captured yet.
- * @param {number} n
+ * Confirm a manually typed part number.
+ * Grabs a camera frame image if no snapshot was taken yet (so the ZIP
+ * still contains something for that step).
  */
 function confirmManual(n) {
   const raw = document.getElementById('manualInput' + n).value.trim().toUpperCase();
-  if (!raw) return; // nothing entered — do nothing
+  if (!raw) return;
 
-  // ── Normalise: strip separators for metal (step 2) ────────────────────
+  // Normalise: strip separators for metal
   const normalised = (n === 2) ? stripSeparators(raw) : raw;
 
-  // ── Try to grab a camera frame if we don't have an image yet ──────────
+  // Grab a still from the camera if available
   if (!state.images[n]) {
     const video = document.getElementById('video' + n);
     if (video.srcObject && video.readyState >= 2) {
@@ -1553,9 +1150,8 @@ function confirmManual(n) {
     stopCamera(n);
   }
 
-  // ── Update state and UI ───────────────────────────────────────────────
   setValue(n, normalised);
-  setOcr(n, `✓ Manual entry: <strong style="color:var(--ok)">${raw}</strong>`, 'success');
+  setOcr(n, `✓ Manual: <strong style="color:var(--ok)">${raw}</strong>`, 'success');
   document.getElementById('badge'      + n).textContent = 'Done';
   document.getElementById('badge'      + n).className   = 'badge badge-done';
   document.getElementById('captureBtn' + n).style.display = 'none';
@@ -1564,153 +1160,99 @@ function confirmManual(n) {
   advanceStep(n);
 }
 
-/**
- * Store a confirmed value in state and update the large display box.
- * @param {number} n     - step number
- * @param {string} val   - normalised (separator-stripped) value
- */
+/** Store a value and update the large display box. */
 function setValue(n, val) {
   state.values[n] = val;
   const d = document.getElementById('partDisplay' + n);
   d.textContent = val;
-  d.className   = 'part-display confirmed'; // green border
+  d.className   = 'part-display confirmed';
 }
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  STEP FLOW CONTROL
+//  STEP FLOW
 // ═══════════════════════════════════════════════════════════════════════════
 
-/**
- * Called after a step is successfully completed.
- * Marks the dot as done and either enables the next step or finalises.
- * @param {number} done - the step that just completed
- */
 function advanceStep(done) {
   document.getElementById('d'    + done).className = 'dot done';
   document.getElementById('card' + done).classList.remove('active-step');
-
-  // Check if all three steps are now done
-  if (state.values[1] && state.values[2] && state.values[3]) {
-    finalise();
-    return;
-  }
-
-  // Otherwise advance to the next incomplete step
+  if (state.values[1] && state.values[2] && state.values[3]) { finalise(); return; }
   if (done === 1 && !state.values[2]) enableStep(2);
   else if (done === 2 && !state.values[3]) enableStep(3);
 }
 
-/**
- * Activate a step: enable its capture button, pulse its card, start camera.
- * @param {number} n
- */
 function enableStep(n) {
   document.getElementById('captureBtn' + n).disabled = false;
   document.getElementById('card'       + n).classList.add('active-step');
   document.getElementById('d'          + n).className = 'dot active';
-  setOcr(n, n === 3 ? 'Point camera at barcode' : 'Point camera at part number');
+  setOcr(n, n === 3 ? 'Point camera — barcode inside the box'
+                    : 'Point camera — part number inside the box');
   startCamera(n);
 }
 
-/**
- * Reset a single step so the user can re-scan it.
- * Clears state, resets UI elements, restarts camera.
- * Also hides the result section if it was showing.
- * @param {number} n
- */
 function retakeStep(n) {
-  // Clear stored data for this step
   state.values[n] = null;
   state.images[n] = null;
-
-  // Reset part display
   const pd = document.getElementById('partDisplay' + n);
-  pd.textContent = '— — — — — — — — — —';
-  pd.className   = 'part-display empty';
-
-  // Reset badge and buttons
+  pd.textContent = '— — — — — — — — — —'; pd.className = 'part-display empty';
   document.getElementById('badge'       + n).textContent = 'Pending';
   document.getElementById('badge'       + n).className   = 'badge badge-pending';
   document.getElementById('retake'      + n).style.display = 'none';
   const btn = document.getElementById('captureBtn' + n);
-  btn.style.display = 'block';
-  btn.disabled = false;
+  btn.style.display = 'block'; btn.disabled = false;
   btn.textContent = n === 3 ? '📷 Capture Barcode'
     : ('📷 Capture ' + (n === 1 ? 'Paper Label' : 'Metal Surface'));
-
-  // Reset camera view (show live video, hide frozen preview)
-  document.getElementById('preview' + n).style.display = 'none';
-  document.getElementById('video'   + n).style.display = 'block';
-  document.getElementById('thumb'   + n).classList.remove('visible');
-
-  // Reactivate card
-  document.getElementById('card' + n).classList.add('active-step');
-  document.getElementById('d'    + n).className = 'dot active';
-
-  // Clear manual input
-  document.getElementById('manualInput' + n).value = '';
-  document.getElementById('manual'      + n).style.display = 'none';
-  setOcr(n, n === 3 ? 'Point camera at barcode' : 'Point camera at part number');
-
-  // Hide result section (user is editing, result is no longer valid)
+  document.getElementById('preview'    + n).style.display = 'none';
+  document.getElementById('video'      + n).style.display = 'block';
+  document.getElementById('thumb'      + n).classList.remove('visible');
+  document.getElementById('card'       + n).classList.add('active-step');
+  document.getElementById('d'          + n).className = 'dot active';
+  document.getElementById('manualInput'+ n).value = '';
+  document.getElementById('manual'     + n).style.display = 'none';
+  setOcr(n, n === 3 ? 'Point camera — barcode inside the box'
+                    : 'Point camera — part number inside the box');
+  // Hide result section
   document.getElementById('statusBanner').className = 'status-banner';
   document.getElementById('compareCard').style.display = 'none';
   document.getElementById('resetBtn').classList.remove('visible');
   document.getElementById('dlBtn').classList.remove('visible');
   document.getElementById('savedInfo').textContent = '';
-  delete finalise._ran; // allow finalise to run again after retake
-
+  delete finalise._ran;
   startCamera(n);
 }
 
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  FINALISE — COMPARE & SHOW RESULT
-//  Called automatically once all three steps have confirmed values.
-//  Compares Paper vs Metal vs Barcode (all normalised, no separators).
 // ═══════════════════════════════════════════════════════════════════════════
 
-/**
- * Compare all three values and display OK / NOK banner + comparison grid.
- * Uses a simple guard (_ran) to prevent running more than once per session.
- */
 function finalise() {
-  if (finalise._ran) return;
-  finalise._ran = true;
-
-  const v1 = state.values[1] || ''; // paper  — already stripped
-  const v2 = state.values[2] || ''; // metal  — already stripped by setValue/confirmManual
-  const v3 = state.values[3] || ''; // barcode — already stripped
-
-  // All three must be non-empty AND identical
-  const isOK = v1 && v2 && v3 && (v1 === v2) && (v2 === v3);
+  if (finalise._ran) return; finalise._ran = true;
+  const v1 = state.values[1] || '';
+  const v2 = state.values[2] || '';
+  const v3 = state.values[3] || '';
+  const isOK = v1 && v2 && v3 && v1 === v2 && v2 === v3;
   const cls  = isOK ? 'compare-val ok-val' : 'compare-val nok-val';
 
-  // ── Populate comparison grid ───────────────────────────────────────────
   document.getElementById('v1').textContent  = v1 || '—';
   document.getElementById('v2').textContent  = v2 || '—';
   document.getElementById('v2b').textContent = v2 || '—';
   document.getElementById('v3').textContent  = v3 || '—';
   ['cmpPaper','cmpMetal','cmpMetal2','cmpBarcode'].forEach(id =>
-    document.getElementById(id).className = cls
-  );
+    document.getElementById(id).className = cls);
   document.getElementById('compareCard').style.display = 'block';
 
-  // ── Status banner ──────────────────────────────────────────────────────
   document.getElementById('statusText').textContent = isOK ? 'OK' : 'NOK';
   document.getElementById('statusSub').textContent  = isOK
     ? 'All three values match — part accepted ✓'
     : `Mismatch — Paper: ${v1||'?'} | Metal: ${v2||'?'} | Barcode: ${v3||'?'}`;
   document.getElementById('statusBanner').className = 'status-banner ' + (isOK ? 'ok' : 'nok');
 
-  // ── Build folder name: YYYYMMDD_HHMMSS_OK  or  …_NOK ─────────────────
-  const ts = state.firstTimestamp || new Date();
-  const pad = n => String(n).padStart(2, '0');
+  const ts  = state.firstTimestamp || new Date();
+  const pad = x => String(x).padStart(2, '0');
   state._folder = `${ts.getFullYear()}${pad(ts.getMonth()+1)}${pad(ts.getDate())}`
                 + `_${pad(ts.getHours())}${pad(ts.getMinutes())}${pad(ts.getSeconds())}`
                 + `_${isOK ? 'OK' : 'NOK'}`;
-
   document.getElementById('savedInfo').textContent = '📁 ' + state._folder;
   document.getElementById('dlBtn').classList.add('visible');
   document.getElementById('resetBtn').classList.add('visible');
@@ -1718,134 +1260,82 @@ function finalise() {
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  DOWNLOAD — ZIP PACKAGE
-//  Bundles the three captured JPEG images plus a JSON log into a ZIP file
-//  named after the session folder (timestamp + result).
+//  DOWNLOAD ZIP
 // ═══════════════════════════════════════════════════════════════════════════
 
-/**
- * Build and trigger download of a ZIP containing:
- *   {folder}/{folder}_paper.jpg
- *   {folder}/{folder}_metal.jpg
- *   {folder}/{folder}_barcode.jpg
- *   {folder}/result.json
- */
 async function downloadPackage() {
-  const zip    = new JSZip();
-  const folder = zip.folder(state._folder);
-  const labels = { 1: 'paper', 2: 'metal', 3: 'barcode' };
-
-  // Add each captured image
+  const zip = new JSZip();
+  const f   = zip.folder(state._folder);
+  const lbl = { 1: 'paper', 2: 'metal', 3: 'barcode' };
   for (let i = 1; i <= 3; i++) {
     if (state.images[i]) {
-      const filename = `${state._folder}_${labels[i]}.jpg`;
-      // Strip the "data:image/jpeg;base64," prefix before storing
-      folder.file(filename, state.images[i].split(',')[1], { base64: true });
+      f.file(`${state._folder}_${lbl[i]}.jpg`, state.images[i].split(',')[1], { base64: true });
     }
   }
-
-  // Add JSON log with all values and metadata
-  folder.file('result.json', JSON.stringify({
+  f.file('result.json', JSON.stringify({
     folder:    state._folder,
     timestamp: state.firstTimestamp?.toISOString(),
     paper:     state.values[1],
     metal:     state.values[2],
     barcode:   state.values[3],
-    result:    state._folder.split('_').pop() // "OK" or "NOK"
+    result:    state._folder.split('_').pop()
   }, null, 2));
-
-  // Generate and trigger browser download
   const blob = await zip.generateAsync({ type: 'blob' });
   const url  = URL.createObjectURL(blob);
-  const a    = document.createElement('a');
-  a.href = url;
-  a.download = state._folder + '.zip';
-  a.click();
-  // Clean up the object URL after a short delay
+  Object.assign(document.createElement('a'), { href: url, download: state._folder + '.zip' }).click();
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  RESET — NEW INSPECTION
-//  Resets ALL state and UI back to the initial state (Step 1 active).
-//  Called by the "New Inspection" button.
+//  RESET
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** Full reset — stops cameras, clears state, rebuilds initial UI. */
 function resetAll() {
-  // Stop all active camera streams
-  [1, 2, 3].forEach(i => stopCamera(i));
-
-  // Reset runtime state
+  [1,2,3].forEach(i => stopCamera(i));
   state.firstTimestamp = null;
-  state.images = { 1: null, 2: null, 3: null };
-  state.values = { 1: null, 2: null, 3: null };
-  delete finalise._ran; // allow finalise to run again in the next session
-
-  // Reset each step's UI elements
-  [1, 2, 3].forEach(i => {
-    // Progress dot
-    document.getElementById('d' + i).className = (i === 1) ? 'dot active' : 'dot';
-    // Card highlight
-    document.getElementById('card' + i).classList.toggle('active-step', i === 1);
-    // Badge
+  state.images = { 1:null, 2:null, 3:null };
+  state.values = { 1:null, 2:null, 3:null };
+  delete finalise._ran;
+  [1,2,3].forEach(i => {
+    document.getElementById('d' + i).className = i===1 ? 'dot active' : 'dot';
+    document.getElementById('card' + i).classList.toggle('active-step', i===1);
     document.getElementById('badge' + i).textContent = 'Pending';
     document.getElementById('badge' + i).className   = 'badge badge-pending';
-    // Capture button
     const btn = document.getElementById('captureBtn' + i);
-    btn.style.display = 'block';
-    btn.disabled = (i !== 1); // only step 1 enabled on reset
-    btn.textContent = i === 3 ? '📷 Capture Barcode'
-      : ('📷 Capture ' + (i === 1 ? 'Paper Label' : 'Metal Surface'));
-    // Camera view
-    document.getElementById('preview' + i).style.display = 'none';
-    document.getElementById('video'   + i).style.display = 'block';
-    // Retake button
-    document.getElementById('retake' + i).style.display = 'none';
-    // Part number display
+    btn.style.display = 'block'; btn.disabled = i !== 1;
+    btn.textContent = i===3 ? '📷 Capture Barcode'
+      : ('📷 Capture ' + (i===1 ? 'Paper Label' : 'Metal Surface'));
+    document.getElementById('preview'    + i).style.display = 'none';
+    document.getElementById('video'      + i).style.display = 'block';
+    document.getElementById('retake'     + i).style.display = 'none';
     const pd = document.getElementById('partDisplay' + i);
-    pd.textContent = '— — — — — — — — — —';
-    pd.className   = 'part-display empty';
-    // Manual entry
-    document.getElementById('manualInput' + i).value = '';
-    document.getElementById('manual'      + i).style.display = 'none';
-    // Thumbnail
-    document.getElementById('thumb' + i).classList.remove('visible');
-    document.getElementById('thumb' + i).src = '';
-    // OCR status
-    const hints = {
-      1: 'Point camera at printed part number',
-      2: 'Complete step 1 first',
-      3: 'Complete steps 1 & 2 first'
-    };
+    pd.textContent = '— — — — — — — — — —'; pd.className = 'part-display empty';
+    document.getElementById('manualInput'+ i).value = '';
+    document.getElementById('manual'     + i).style.display = 'none';
+    document.getElementById('thumb'      + i).classList.remove('visible');
+    document.getElementById('thumb'      + i).src = '';
+    const hints = { 1: 'Point camera — part number inside the box',
+                    2: 'Complete step 1 first',
+                    3: 'Complete steps 1 & 2 first' };
     setOcr(i, hints[i]);
   });
-
-  // Hide result section
-  document.getElementById('thumbStrip').style.display   = 'none';
-  document.getElementById('compareCard').style.display  = 'none';
-  document.getElementById('statusBanner').className     = 'status-banner';
+  document.getElementById('thumbStrip').style.display  = 'none';
+  document.getElementById('compareCard').style.display = 'none';
+  document.getElementById('statusBanner').className    = 'status-banner';
   document.getElementById('resetBtn').classList.remove('visible');
   document.getElementById('dlBtn').classList.remove('visible');
-  document.getElementById('savedInfo').textContent      = '';
-
-  // Restart step 1 camera
+  document.getElementById('savedInfo').textContent     = '';
+  document.getElementById('debugPanel').classList.remove('visible');
+  document.getElementById('debugImgs').innerHTML       = '';
   startCamera(1);
 }
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  HELPER: setOcr
-//  Update the OCR status line for a given step with optional CSS class.
+//  HELPER
 // ═══════════════════════════════════════════════════════════════════════════
 
-/**
- * Set the content and style of an OCR status row.
- * @param {number} n     - step number
- * @param {string} html  - inner HTML (may contain tags/spans)
- * @param {string} cls   - additional CSS class: 'thinking'|'success'|'warn'|'fail'|''
- */
 function setOcr(n, html, cls = '') {
   const el = document.getElementById('ocr' + n);
   el.className = 'ocr-result' + (cls ? ' ' + cls : '');
@@ -1854,28 +1344,15 @@ function setOcr(n, html, cls = '') {
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  INITIALISATION
-//  Called once on page load.
+//  INIT
 // ═══════════════════════════════════════════════════════════════════════════
 window.addEventListener('load', () => {
-  // Show or hide API key banner based on stored key
-  initApiKeyUI();
-
-  // Set connectivity pill and engine banner
-  updateConnUI();
-
-  // Start rear camera for step 1 immediately
   startCamera(1);
-
-  // Pre-warm Tesseract in the background so it's ready when needed
-  // (even if we're online, it's loaded as a fallback)
-  initTesseract().then(updateConnUI);
-
-  // Register service worker for offline caching
+  // Pre-warm Tesseract in background (downloads ~10 MB eng.traineddata once,
+  // then cached by service worker for offline use)
+  initTesseract();
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('./sw.js').catch(err =>
-      console.warn('Service worker registration failed:', err)
-    );
+    navigator.serviceWorker.register('./sw.js').catch(() => {});
   }
 });
 </script>
