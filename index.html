@@ -1,0 +1,999 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#0a0a0a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="manifest.json">
+<title>Part Checker</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow+Condensed:wght@300;500;700;900&display=swap');
+
+:root {
+–bg: #0a0a0a;
+–surface: #111111;
+–border: #222;
+–accent: #00e5ff;
+–ok: #00ff88;
+–nok: #ff2d55;
+–text: #e8e8e8;
+–muted: #555;
+–mono: ‘Share Tech Mono’, monospace;
+–sans: ‘Barlow Condensed’, sans-serif;
+}
+
+- { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+background: var(–bg);
+color: var(–text);
+font-family: var(–sans);
+height: 100%;
+overflow-x: hidden;
+-webkit-font-smoothing: antialiased;
+}
+
+body {
+display: flex;
+flex-direction: column;
+min-height: 100dvh;
+}
+
+/* HEADER */
+header {
+padding: 14px 20px;
+border-bottom: 1px solid var(–border);
+display: flex;
+align-items: center;
+justify-content: space-between;
+background: var(–surface);
+position: sticky; top: 0; z-index: 100;
+}
+header h1 {
+font-family: var(–sans);
+font-weight: 900;
+font-size: 1.3rem;
+letter-spacing: 0.12em;
+text-transform: uppercase;
+color: var(–accent);
+}
+.step-indicator {
+display: flex;
+gap: 6px;
+align-items: center;
+}
+.dot {
+width: 8px; height: 8px;
+border-radius: 50%;
+background: var(–muted);
+transition: all 0.3s;
+}
+.dot.active { background: var(–accent); box-shadow: 0 0 8px var(–accent); }
+.dot.done { background: var(–ok); }
+
+/* MAIN */
+main {
+flex: 1;
+display: flex;
+flex-direction: column;
+padding: 20px;
+gap: 16px;
+max-width: 600px;
+width: 100%;
+margin: 0 auto;
+}
+
+.step-label {
+font-family: var(–mono);
+font-size: 0.7rem;
+color: var(–accent);
+letter-spacing: 0.15em;
+text-transform: uppercase;
+margin-bottom: 4px;
+}
+
+.card {
+background: var(–surface);
+border: 1px solid var(–border);
+border-radius: 4px;
+padding: 16px;
+position: relative;
+overflow: hidden;
+}
+.card::before {
+content: ‘’;
+position: absolute;
+top: 0; left: 0;
+width: 3px; height: 100%;
+background: var(–accent);
+}
+
+.card h2 {
+font-size: 1.1rem;
+font-weight: 700;
+letter-spacing: 0.08em;
+text-transform: uppercase;
+margin-bottom: 12px;
+padding-left: 10px;
+}
+
+/* CAMERA */
+.camera-container {
+position: relative;
+width: 100%;
+aspect-ratio: 4/3;
+background: #000;
+border-radius: 2px;
+overflow: hidden;
+border: 1px solid var(–border);
+}
+.camera-container video,
+.camera-container canvas.preview {
+width: 100%; height: 100%;
+object-fit: cover;
+display: block;
+}
+.camera-container canvas.preview {
+position: absolute; top: 0; left: 0;
+display: none;
+}
+
+/* Viewfinder overlay */
+.viewfinder {
+position: absolute;
+top: 50%; left: 50%;
+transform: translate(-50%, -50%);
+width: 75%; height: 40%;
+border: 2px solid var(–accent);
+pointer-events: none;
+opacity: 0.6;
+}
+.viewfinder::before, .viewfinder::after,
+.viewfinder span::before, .viewfinder span::after {
+content: ‘’;
+position: absolute;
+width: 14px; height: 14px;
+border-color: var(–accent);
+border-style: solid;
+}
+.viewfinder::before { top: -2px; left: -2px; border-width: 2px 0 0 2px; }
+.viewfinder::after  { top: -2px; right: -2px; border-width: 2px 2px 0 0; }
+.viewfinder span::before { bottom: -2px; left: -2px; border-width: 0 0 2px 2px; }
+.viewfinder span::after  { bottom: -2px; right: -2px; border-width: 0 2px 2px 0; }
+
+/* Capture btn */
+.capture-btn {
+display: block;
+width: 100%;
+margin-top: 12px;
+padding: 14px;
+background: transparent;
+border: 1px solid var(–accent);
+color: var(–accent);
+font-family: var(–sans);
+font-size: 1rem;
+font-weight: 700;
+letter-spacing: 0.15em;
+text-transform: uppercase;
+cursor: pointer;
+border-radius: 2px;
+transition: all 0.15s;
+position: relative;
+overflow: hidden;
+}
+.capture-btn:active {
+background: var(–accent);
+color: #000;
+}
+.capture-btn:disabled {
+opacity: 0.3;
+cursor: not-allowed;
+}
+
+/* PART NUMBER display */
+.part-display {
+font-family: var(–mono);
+font-size: 2rem;
+letter-spacing: 0.2em;
+color: var(–accent);
+text-align: center;
+padding: 16px 8px;
+background: #000;
+border: 1px solid #1a1a1a;
+border-radius: 2px;
+min-height: 64px;
+display: flex;
+align-items: center;
+justify-content: center;
+word-break: break-all;
+}
+.part-display.empty { color: var(–muted); font-size: 0.85rem; letter-spacing: 0.05em; }
+
+/* Comparison row */
+.compare-row {
+display: grid;
+grid-template-columns: 1fr auto 1fr;
+gap: 8px;
+align-items: center;
+}
+.compare-val {
+font-family: var(–mono);
+font-size: 1rem;
+text-align: center;
+padding: 10px 6px;
+border: 1px solid var(–border);
+border-radius: 2px;
+background: #000;
+word-break: break-all;
+}
+.compare-val.ok-text { color: var(–ok); border-color: var(–ok); }
+.compare-val.nok-text { color: var(–nok); border-color: var(–nok); }
+.vs-label {
+font-family: var(–mono);
+color: var(–muted);
+font-size: 0.75rem;
+text-align: center;
+}
+
+/* STATUS BANNER */
+.status-banner {
+display: none;
+width: 100%;
+padding: 28px 16px;
+text-align: center;
+border-radius: 4px;
+border: 2px solid;
+flex-direction: column;
+gap: 8px;
+animation: bangIn 0.25s cubic-bezier(0.2, 1.5, 0.5, 1);
+}
+@keyframes bangIn {
+from { transform: scale(0.85); opacity: 0; }
+to   { transform: scale(1);    opacity: 1; }
+}
+.status-banner.ok  { border-color: var(–ok);  background: rgba(0,255,136,0.08); display: flex; }
+.status-banner.nok { border-color: var(–nok); background: rgba(255,45,85,0.08); display: flex; }
+.status-big {
+font-family: var(–sans);
+font-size: 5rem;
+font-weight: 900;
+letter-spacing: 0.1em;
+line-height: 1;
+}
+.status-banner.ok  .status-big { color: var(–ok); text-shadow: 0 0 30px var(–ok); }
+.status-banner.nok .status-big { color: var(–nok); text-shadow: 0 0 30px var(–nok); }
+.status-sub {
+font-family: var(–mono);
+font-size: 0.75rem;
+letter-spacing: 0.1em;
+opacity: 0.7;
+}
+
+/* LOG */
+.saved-info {
+font-family: var(–mono);
+font-size: 0.7rem;
+color: var(–muted);
+text-align: center;
+padding: 8px;
+letter-spacing: 0.05em;
+}
+
+/* RESET BTN */
+.reset-btn {
+display: none;
+width: 100%;
+padding: 16px;
+background: transparent;
+border: 1px solid var(–muted);
+color: var(–text);
+font-family: var(–sans);
+font-size: 1rem;
+font-weight: 700;
+letter-spacing: 0.15em;
+text-transform: uppercase;
+cursor: pointer;
+border-radius: 2px;
+transition: all 0.2s;
+}
+.reset-btn:hover { border-color: var(–text); }
+.reset-btn.visible { display: block; }
+
+/* Retake small btn */
+.retake-btn {
+padding: 6px 14px;
+background: transparent;
+border: 1px solid var(–muted);
+color: var(–muted);
+font-family: var(–mono);
+font-size: 0.7rem;
+letter-spacing: 0.1em;
+text-transform: uppercase;
+cursor: pointer;
+border-radius: 2px;
+margin-top: 8px;
+transition: all 0.15s;
+}
+.retake-btn:hover { color: var(–text); border-color: var(–text); }
+
+/* Thumbnail strip */
+.thumb-strip {
+display: flex;
+gap: 8px;
+margin-top: 12px;
+}
+.thumb {
+flex: 1;
+aspect-ratio: 4/3;
+object-fit: cover;
+border: 1px solid var(–border);
+border-radius: 2px;
+display: none;
+}
+.thumb.visible { display: block; }
+
+/* OCR result */
+.ocr-result {
+font-family: var(–mono);
+font-size: 0.75rem;
+color: var(–muted);
+text-align: center;
+padding: 4px;
+}
+
+/* Manual override */
+.manual-input-wrap {
+display: flex;
+gap: 8px;
+align-items: center;
+margin-top: 8px;
+}
+.manual-input {
+flex: 1;
+background: #000;
+border: 1px solid var(–border);
+color: var(–text);
+font-family: var(–mono);
+font-size: 1rem;
+padding: 10px 12px;
+border-radius: 2px;
+text-transform: uppercase;
+letter-spacing: 0.1em;
+outline: none;
+transition: border-color 0.2s;
+}
+.manual-input:focus { border-color: var(–accent); }
+.manual-confirm-btn {
+padding: 10px 16px;
+background: var(–accent);
+border: none;
+color: #000;
+font-family: var(–sans);
+font-weight: 700;
+font-size: 0.9rem;
+letter-spacing: 0.1em;
+cursor: pointer;
+border-radius: 2px;
+text-transform: uppercase;
+}
+
+.section-title {
+font-family: var(–sans);
+font-size: 0.85rem;
+font-weight: 700;
+letter-spacing: 0.12em;
+text-transform: uppercase;
+color: var(–muted);
+margin-bottom: 8px;
+padding-left: 10px;
+}
+
+/* Pulsing accent on active card */
+.card.active-step::before {
+animation: pulse 1.5s ease-in-out infinite alternate;
+}
+@keyframes pulse {
+from { opacity: 1; }
+to   { opacity: 0.3; }
+}
+
+.badge {
+display: inline-block;
+padding: 2px 8px;
+border-radius: 2px;
+font-family: var(–mono);
+font-size: 0.65rem;
+letter-spacing: 0.1em;
+text-transform: uppercase;
+margin-left: 8px;
+vertical-align: middle;
+}
+.badge-pending { background: rgba(255,255,255,0.07); color: var(–muted); }
+.badge-done    { background: rgba(0,255,136,0.15); color: var(–ok); }
+.badge-error   { background: rgba(255,45,85,0.15); color: var(–nok); }
+
+/* Hidden canvas for captures */
+canvas.hidden { display: none; }
+
+/* OPFS note */
+.opfs-note {
+font-family: var(–mono);
+font-size: 0.65rem;
+color: var(–muted);
+text-align: center;
+padding: 4px 0 0;
+}
+
+/* Download btn */
+.dl-btn {
+display: none;
+width: 100%;
+padding: 14px;
+background: transparent;
+border: 1px solid var(–ok);
+color: var(–ok);
+font-family: var(–sans);
+font-size: 1rem;
+font-weight: 700;
+letter-spacing: 0.15em;
+text-transform: uppercase;
+cursor: pointer;
+border-radius: 2px;
+transition: all 0.15s;
+}
+.dl-btn:hover { background: rgba(0,255,136,0.1); }
+.dl-btn.visible { display: block; }
+</style>
+
+</head>
+<body>
+
+<header>
+  <h1>⬡ Part Checker</h1>
+  <div class="step-indicator">
+    <div class="dot active" id="d1"></div>
+    <div class="dot" id="d2"></div>
+    <div class="dot" id="d3"></div>
+  </div>
+</header>
+
+<main>
+
+  <!-- STEP 1: Paper part number -->
+
+  <div class="card active-step" id="card1">
+    <div class="step-label">Step 1 / 3</div>
+    <h2>Paper Part Number <span class="badge badge-pending" id="badge1">Pending</span></h2>
+    <div class="camera-container" id="cam1wrap">
+      <video id="video1" autoplay playsinline muted></video>
+      <canvas class="preview" id="preview1"></canvas>
+      <div class="viewfinder"><span></span></div>
+    </div>
+    <button class="capture-btn" id="captureBtn1" onclick="captureStep(1)">📷 Capture Paper</button>
+    <div class="ocr-result" id="ocr1">Point camera at printed part number</div>
+    <div class="manual-input-wrap" id="manual1">
+      <input class="manual-input" id="manualInput1" maxlength="7" placeholder="e.g. 123456A" oninput="sanitizePartInput(this)">
+      <button class="manual-confirm-btn" onclick="confirmManual(1)">Set</button>
+    </div>
+    <div class="part-display empty" id="partDisplay1">— — — — — — —</div>
+    <button class="retake-btn" id="retake1" onclick="retakeStep(1)" style="display:none">↺ Retake</button>
+  </div>
+
+  <!-- STEP 2: Metal part number -->
+
+  <div class="card" id="card2">
+    <div class="step-label">Step 2 / 3</div>
+    <h2>Metal Part Number <span class="badge badge-pending" id="badge2">Pending</span></h2>
+    <div class="camera-container" id="cam2wrap">
+      <video id="video2" autoplay playsinline muted></video>
+      <canvas class="preview" id="preview2"></canvas>
+      <div class="viewfinder"><span></span></div>
+    </div>
+    <button class="capture-btn" id="captureBtn2" onclick="captureStep(2)" disabled>📷 Capture Metal</button>
+    <div class="ocr-result" id="ocr2">Complete step 1 first</div>
+    <div class="manual-input-wrap" id="manual2" style="display:none">
+      <input class="manual-input" id="manualInput2" maxlength="7" placeholder="e.g. 123456A" oninput="sanitizePartInput(this)">
+      <button class="manual-confirm-btn" onclick="confirmManual(2)">Set</button>
+    </div>
+    <div class="part-display empty" id="partDisplay2">— — — — — — —</div>
+    <button class="retake-btn" id="retake2" onclick="retakeStep(2)" style="display:none">↺ Retake</button>
+  </div>
+
+  <!-- STEP 3: Barcode -->
+
+  <div class="card" id="card3">
+    <div class="step-label">Step 3 / 3</div>
+    <h2>Barcode Scan <span class="badge badge-pending" id="badge3">Pending</span></h2>
+    <div class="camera-container" id="cam3wrap">
+      <video id="video3" autoplay playsinline muted></video>
+      <canvas class="preview" id="preview3"></canvas>
+      <div class="viewfinder"><span></span></div>
+    </div>
+    <button class="capture-btn" id="captureBtn3" onclick="captureStep(3)" disabled>📷 Capture Barcode</button>
+    <div class="ocr-result" id="ocr3">Complete steps 1 & 2 first</div>
+    <div class="manual-input-wrap" id="manual3" style="display:none">
+      <input class="manual-input" id="manualInput3" maxlength="7" placeholder="Barcode value" oninput="sanitizePartInput(this)">
+      <button class="manual-confirm-btn" onclick="confirmManual(3)">Set</button>
+    </div>
+    <div class="part-display empty" id="partDisplay3">— — — — — — —</div>
+    <button class="retake-btn" id="retake3" onclick="retakeStep(3)" style="display:none">↺ Retake</button>
+  </div>
+
+  <!-- COMPARISON -->
+
+  <div class="card" id="compareCard" style="display:none">
+    <div class="step-label">Comparison</div>
+    <h2>Part Numbers</h2>
+    <div class="compare-row">
+      <div class="compare-val" id="cmpPaper">—</div>
+      <div class="vs-label">vs<br>vs</div>
+      <div class="compare-val" id="cmpMetal">—</div>
+    </div>
+    <div style="margin-top:8px" class="compare-row">
+      <div class="compare-val" id="cmpMetal2" style="grid-column:1/2">—</div>
+      <div class="vs-label">vs</div>
+      <div class="compare-val" id="cmpBarcode">—</div>
+    </div>
+  </div>
+
+  <!-- STATUS -->
+
+  <div class="status-banner" id="statusBanner">
+    <div class="status-big" id="statusText">OK</div>
+    <div class="status-sub" id="statusSub">All three match</div>
+  </div>
+
+  <!-- THUMBNAILS -->
+
+  <div class="thumb-strip" id="thumbStrip" style="display:none">
+    <img class="thumb" id="thumb1">
+    <img class="thumb" id="thumb2">
+    <img class="thumb" id="thumb3">
+  </div>
+
+  <div class="saved-info" id="savedInfo"></div>
+
+  <!-- DOWNLOAD -->
+
+<button class="dl-btn" id="dlBtn" onclick="downloadPackage()">⬇ Download Images (ZIP)</button>
+
+  <!-- RESET -->
+
+<button class="reset-btn" id="resetBtn" onclick="resetAll()">↺ New Inspection</button>
+
+</main>
+
+<!-- Hidden capture canvas -->
+
+<canvas class="hidden" id="captureCanvas"></canvas>
+
+<!-- JSZip for packaging -->
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+
+<!-- Tesseract for OCR -->
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/4.1.2/tesseract.min.js"></script>
+
+<!-- ZXing for barcode -->
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/zxing-wasm/2.0.3/full/zxing_full.min.js" onerror="zxingFailed=true"></script>
+
+<script>
+// ─── STATE ──────────────────────────────────────────────────────────────────
+const state = {
+  step: 1,
+  firstTimestamp: null,
+  images: { 1: null, 2: null, 3: null },   // base64 jpeg
+  values: { 1: null, 2: null, 3: null },
+  streams: {},
+  worker: null
+};
+
+let zxingFailed = false;
+
+// ─── UTILS ───────────────────────────────────────────────────────────────────
+function formatPartNumber(s) {
+  return s ? s.toUpperCase().replace(/[^A-Z0-9]/g, '') : '';
+}
+function validatePartNumber(s) {
+  return /^[0-9]{6}[A-Za-z]$/.test(s);
+}
+function sanitizePartInput(el) {
+  el.value = el.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+function pad2(n) { return String(n).padStart(2,'0'); }
+function getTimestampStr(d) {
+  return `${d.getFullYear()}${pad2(d.getMonth()+1)}${pad2(d.getDate())}_${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
+}
+
+// ─── CAMERA ──────────────────────────────────────────────────────────────────
+async function startCamera(stepNum) {
+  const video = document.getElementById(`video${stepNum}`);
+  try {
+    if (state.streams[stepNum]) {
+      state.streams[stepNum].getTracks().forEach(t => t.stop());
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false
+    });
+    state.streams[stepNum] = stream;
+    video.srcObject = stream;
+    video.style.display = 'block';
+    document.getElementById(`preview${stepNum}`).style.display = 'none';
+  } catch(e) {
+    console.warn('Camera error', e);
+    setOcr(stepNum, '⚠ Camera unavailable — use manual input');
+    showManual(stepNum);
+  }
+}
+
+function stopCamera(stepNum) {
+  if (state.streams[stepNum]) {
+    state.streams[stepNum].getTracks().forEach(t => t.stop());
+    delete state.streams[stepNum];
+  }
+}
+
+// ─── OCR ─────────────────────────────────────────────────────────────────────
+async function initWorker() {
+  if (state.worker) return;
+  try {
+    state.worker = await Tesseract.createWorker('eng', 1, {
+      logger: () => {}
+    });
+    await state.worker.setParameters({
+      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+      tessedit_pageseg_mode: '7',
+    });
+  } catch(e) {
+    console.warn('Tesseract init failed', e);
+  }
+}
+
+async function runOCR(imageData) {
+  await initWorker();
+  if (!state.worker) return null;
+  try {
+    const { data: { text } } = await state.worker.recognize(imageData);
+    const cleaned = text.trim().replace(/[^A-Z0-9]/gi, '').toUpperCase();
+    // Try to find a 7-char part number: 6 digits + 1 letter
+    const match = cleaned.match(/[0-9]{6}[A-Z]/);
+    return match ? match[0] : cleaned.slice(0, 7) || null;
+  } catch(e) {
+    return null;
+  }
+}
+
+async function runBarcode(video) {
+  // Try BarcodeDetector API first
+  if ('BarcodeDetector' in window) {
+    try {
+      const bd = new BarcodeDetector();
+      const results = await bd.detect(video);
+      if (results.length > 0) return results[0].rawValue;
+    } catch(e) {}
+  }
+  return null;
+}
+
+// ─── CAPTURE ─────────────────────────────────────────────────────────────────
+async function captureStep(stepNum) {
+  const video = document.getElementById(`video${stepNum}`);
+  const canvas = document.getElementById('captureCanvas');
+  const preview = document.getElementById(`preview${stepNum}`);
+  const btn = document.getElementById(`captureBtn${stepNum}`);
+
+  if (!video.srcObject) { showManual(stepNum); return; }
+
+  btn.disabled = true;
+  btn.textContent = '⏳ Processing…';
+
+  // Snapshot
+  canvas.width  = video.videoWidth  || 640;
+  canvas.height = video.videoHeight || 480;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(video, 0, 0);
+  const imageData = canvas.toDataURL('image/jpeg', 0.92);
+
+  // Show preview
+  preview.width  = canvas.width;
+  preview.height = canvas.height;
+  preview.getContext('2d').drawImage(canvas, 0, 0);
+  preview.style.display = 'block';
+  video.style.display = 'none';
+
+  // Store image
+  if (!state.firstTimestamp && stepNum === 1) {
+    state.firstTimestamp = new Date();
+  }
+  state.images[stepNum] = imageData;
+
+  // Show thumbnail
+  const thumb = document.getElementById(`thumb${stepNum}`);
+  thumb.src = imageData;
+  thumb.classList.add('visible');
+  document.getElementById('thumbStrip').style.display = 'flex';
+
+  stopCamera(stepNum);
+
+  // Recognise value
+  let value = null;
+  if (stepNum === 3) {
+    // barcode
+    setOcr(stepNum, '🔍 Scanning barcode…');
+    value = await runBarcode(video);
+    if (!value) {
+      // fallback to OCR on captured image
+      value = await runOCR(imageData);
+    }
+  } else {
+    setOcr(stepNum, '🔍 Reading part number via OCR…');
+    value = await runOCR(imageData);
+  }
+
+  if (value) {
+    setOcr(stepNum, `✓ Detected: ${value}`);
+    setValue(stepNum, value);
+    document.getElementById(`badge${stepNum}`).textContent = 'Done';
+    document.getElementById(`badge${stepNum}`).className = 'badge badge-done';
+    document.getElementById(`retake${stepNum}`).style.display = 'inline-block';
+    btn.style.display = 'none';
+    hideManual(stepNum);
+    advanceStep(stepNum);
+  } else {
+    setOcr(stepNum, '⚠ Could not auto-read — enter manually below');
+    showManual(stepNum);
+    btn.textContent = '📷 Re-capture';
+    btn.disabled = false;
+    document.getElementById(`retake${stepNum}`).style.display = 'none';
+  }
+}
+
+function setOcr(stepNum, msg) {
+  document.getElementById(`ocr${stepNum}`).textContent = msg;
+}
+
+function showManual(stepNum) {
+  document.getElementById(`manual${stepNum}`).style.display = 'flex';
+}
+function hideManual(stepNum) {
+  document.getElementById(`manual${stepNum}`).style.display = 'none';
+}
+
+function confirmManual(stepNum) {
+  const input = document.getElementById(`manualInput${stepNum}`);
+  const raw = input.value.trim().toUpperCase();
+  if (!raw) { return; }
+  setValue(stepNum, raw);
+  setOcr(stepNum, `✓ Manual entry: ${raw}`);
+  document.getElementById(`badge${stepNum}`).textContent = 'Done';
+  document.getElementById(`badge${stepNum}`).className = 'badge badge-done';
+  document.getElementById(`captureBtn${stepNum}`).style.display = 'none';
+  document.getElementById(`retake${stepNum}`).style.display = 'inline-block';
+  hideManual(stepNum);
+
+  // If no image yet for this step, capture current video frame if available
+  if (!state.images[stepNum]) {
+    const video = document.getElementById(`video${stepNum}`);
+    if (video.srcObject && video.readyState >= 2) {
+      const canvas = document.getElementById('captureCanvas');
+      canvas.width  = video.videoWidth  || 640;
+      canvas.height = video.videoHeight || 480;
+      canvas.getContext('2d').drawImage(video, 0, 0);
+      const imageData = canvas.toDataURL('image/jpeg', 0.9);
+      state.images[stepNum] = imageData;
+      const thumb = document.getElementById(`thumb${stepNum}`);
+      thumb.src = imageData;
+      thumb.classList.add('visible');
+      document.getElementById('thumbStrip').style.display = 'flex';
+    }
+    if (!state.firstTimestamp && stepNum === 1) state.firstTimestamp = new Date();
+    stopCamera(stepNum);
+  }
+
+  advanceStep(stepNum);
+}
+
+function setValue(stepNum, val) {
+  state.values[stepNum] = val;
+  const disp = document.getElementById(`partDisplay${stepNum}`);
+  disp.textContent = val;
+  disp.classList.remove('empty');
+}
+
+// ─── STEP FLOW ────────────────────────────────────────────────────────────────
+function advanceStep(doneStep) {
+  document.getElementById(`d${doneStep}`).className = 'dot done';
+  document.getElementById(`card${doneStep}`).classList.remove('active-step');
+
+  if (doneStep === 1 && !state.values[2]) {
+    enableStep(2);
+  } else if (doneStep === 2 && !state.values[3]) {
+    enableStep(3);
+  } else if (doneStep === 3 || (state.values[1] && state.values[2] && state.values[3])) {
+    finalise();
+  }
+
+  // also check if all done
+  if (state.values[1] && state.values[2] && state.values[3]) {
+    finalise();
+  }
+}
+
+function enableStep(stepNum) {
+  const btn = document.getElementById(`captureBtn${stepNum}`);
+  btn.disabled = false;
+  document.getElementById(`card${stepNum}`).classList.add('active-step');
+  document.getElementById(`d${stepNum}`).className = 'dot active';
+  setOcr(stepNum, stepNum === 3 ? 'Point camera at barcode' : 'Point camera at part number');
+  startCamera(stepNum);
+}
+
+function retakeStep(stepNum) {
+  state.values[stepNum] = null;
+  state.images[stepNum] = null;
+  document.getElementById(`partDisplay${stepNum}`).textContent = '— — — — — — —';
+  document.getElementById(`partDisplay${stepNum}`).classList.add('empty');
+  document.getElementById(`badge${stepNum}`).textContent = 'Pending';
+  document.getElementById(`badge${stepNum}`).className = 'badge badge-pending';
+  document.getElementById(`retake${stepNum}`).style.display = 'none';
+  document.getElementById(`captureBtn${stepNum}`).style.display = 'block';
+  document.getElementById(`captureBtn${stepNum}`).disabled = false;
+  document.getElementById(`captureBtn${stepNum}`).textContent = stepNum === 3 ? '📷 Capture Barcode' : `📷 Capture ${stepNum === 1 ? 'Paper' : 'Metal'}`;
+  document.getElementById(`preview${stepNum}`).style.display = 'none';
+  document.getElementById(`video${stepNum}`).style.display = 'block';
+  document.getElementById(`thumb${stepNum}`).classList.remove('visible');
+  document.getElementById(`card${stepNum}`).classList.add('active-step');
+  document.getElementById(`d${stepNum}`).className = 'dot active';
+
+  // Hide result section
+  document.getElementById('statusBanner').className = 'status-banner';
+  document.getElementById('compareCard').style.display = 'none';
+  document.getElementById('resetBtn').classList.remove('visible');
+  document.getElementById('dlBtn').classList.remove('visible');
+  document.getElementById('savedInfo').textContent = '';
+
+  startCamera(stepNum);
+}
+
+// ─── FINALISE ─────────────────────────────────────────────────────────────────
+async function finalise() {
+  // Prevent double-run
+  if (finalise._ran) return;
+  finalise._ran = true;
+
+  const v1 = state.values[1] || '';
+  const v2 = state.values[2] || '';
+  const v3 = state.values[3] || '';
+
+  const isOK = v1 && v2 && v3 && (v1 === v2) && (v2 === v3);
+  const result = isOK ? 'OK' : 'NOK';
+
+  // Show comparison
+  const cmpPaper  = document.getElementById('cmpPaper');
+  const cmpMetal  = document.getElementById('cmpMetal');
+  const cmpMetal2 = document.getElementById('cmpMetal2');
+  const cmpBarcode= document.getElementById('cmpBarcode');
+
+  const cls = isOK ? 'compare-val ok-text' : 'compare-val nok-text';
+  cmpPaper.className  = cls; cmpPaper.textContent  = v1 || '—';
+  cmpMetal.className  = cls; cmpMetal.textContent  = v2 || '—';
+  cmpMetal2.className = cls; cmpMetal2.textContent = v2 || '—';
+  cmpBarcode.className= cls; cmpBarcode.textContent= v3 || '—';
+  document.getElementById('compareCard').style.display = 'block';
+
+  // Status banner
+  const banner = document.getElementById('statusBanner');
+  document.getElementById('statusText').textContent = result;
+  document.getElementById('statusSub').textContent = isOK
+    ? 'All three values match — part accepted'
+    : `Mismatch detected — Paper: ${v1} | Metal: ${v2} | Barcode: ${v3}`;
+  banner.className = `status-banner ${isOK ? 'ok' : 'nok'}`;
+
+  // Folder / filenames
+  const ts = state.firstTimestamp || new Date();
+  const folderName = `${getTimestampStr(ts)}_${result}`;
+
+  // Save images as ZIP
+  state._folderName = folderName;
+  document.getElementById('savedInfo').textContent = `📁 Folder: ${folderName}`;
+  document.getElementById('dlBtn').classList.add('visible');
+  document.getElementById('resetBtn').classList.add('visible');
+}
+
+// ─── DOWNLOAD ZIP ─────────────────────────────────────────────────────────────
+async function downloadPackage() {
+  const zip = new JSZip();
+  const folder = zip.folder(state._folderName);
+
+  const labels = { 1: 'paper', 2: 'metal', 3: 'barcode' };
+  for (let i = 1; i <= 3; i++) {
+    if (state.images[i]) {
+      const b64 = state.images[i].split(',')[1];
+      folder.file(`${state._folderName}_${labels[i]}.jpg`, b64, { base64: true });
+    }
+  }
+
+  // Also save a small JSON log
+  const log = {
+    folder: state._folderName,
+    timestamp: state.firstTimestamp?.toISOString(),
+    paper: state.values[1],
+    metal: state.values[2],
+    barcode: state.values[3],
+    result: state._folderName.endsWith('_OK') ? 'OK' : 'NOK'
+  };
+  folder.file('result.json', JSON.stringify(log, null, 2));
+
+  const blob = await zip.generateAsync({ type: 'blob' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${state._folderName}.zip`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+// ─── RESET ───────────────────────────────────────────────────────────────────
+function resetAll() {
+  // Stop all cameras
+  [1,2,3].forEach(i => stopCamera(i));
+
+  // Reset state
+  state.step = 1;
+  state.firstTimestamp = null;
+  state.images = { 1: null, 2: null, 3: null };
+  state.values = { 1: null, 2: null, 3: null };
+  delete finalise._ran;
+
+  // Reset UI
+  [1,2,3].forEach(i => {
+    document.getElementById(`d${i}`).className = i === 1 ? 'dot active' : 'dot';
+    document.getElementById(`card${i}`).classList.toggle('active-step', i === 1);
+    document.getElementById(`badge${i}`).textContent = 'Pending';
+    document.getElementById(`badge${i}`).className = 'badge badge-pending';
+    document.getElementById(`captureBtn${i}`).style.display = 'block';
+    document.getElementById(`captureBtn${i}`).disabled = i !== 1;
+    document.getElementById(`captureBtn${i}`).textContent = i === 3 ? '📷 Capture Barcode' : `📷 Capture ${i === 1 ? 'Paper' : 'Metal'}`;
+    document.getElementById(`preview${i}`).style.display = 'none';
+    document.getElementById(`video${i}`).style.display = 'block';
+    document.getElementById(`retake${i}`).style.display = 'none';
+    document.getElementById(`partDisplay${i}`).textContent = '— — — — — — —';
+    document.getElementById(`partDisplay${i}`).classList.add('empty');
+    document.getElementById(`manualInput${i}`).value = '';
+    document.getElementById(`manual${i}`).style.display = i === 1 ? 'flex' : 'none';
+    document.getElementById(`ocr${i}`).textContent = i === 1 ? 'Point camera at printed part number' : i === 2 ? 'Complete step 1 first' : 'Complete steps 1 & 2 first';
+    document.getElementById(`thumb${i}`).classList.remove('visible');
+    document.getElementById(`thumb${i}`).src = '';
+  });
+
+  document.getElementById('thumbStrip').style.display = 'none';
+  document.getElementById('compareCard').style.display = 'none';
+  document.getElementById('statusBanner').className = 'status-banner';
+  document.getElementById('resetBtn').classList.remove('visible');
+  document.getElementById('dlBtn').classList.remove('visible');
+  document.getElementById('savedInfo').textContent = '';
+
+  startCamera(1);
+}
+
+// ─── INIT ────────────────────────────────────────────────────────────────────
+window.addEventListener('load', () => {
+  startCamera(1);
+  showManual(1);
+  initWorker();
+
+  // Register service worker for PWA
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('./sw.js').catch(() => {});
+  }
+});
+</script>
+
+</body>
+</html>
