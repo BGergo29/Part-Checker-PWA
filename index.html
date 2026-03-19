@@ -1356,33 +1356,15 @@ document.addEventListener('DOMContentLoaded', () => {
  * Check camera permission state before attempting getUserMedia.
  * Returns 'granted' | 'denied' | 'prompt' | 'unknown'
  */
-async function checkCameraPermission() {
-  if (!navigator.permissions) return 'unknown';
-  try {
-    const result = await navigator.permissions.query({ name: 'camera' });
-    return result.state; // 'granted' | 'denied' | 'prompt'
-  } catch (e) {
-    return 'unknown';
-  }
-}
-
-/**
- * Show the camera permission error banner with instructions.
- */
 function showPermissionError(errorName) {
-  const banner = document.getElementById('camPermBanner');
-  banner.classList.add('visible');
-  // Also update each step's OCR row
+  console.warn('[PartChecker] Camera permission error:', errorName);
+  document.getElementById('camPermBanner').classList.add('visible');
   [1, 2, 3].forEach(i => {
     setOcr(i, '⚠ Camera permission denied — see instructions above', 'fail');
     document.getElementById('captureBtn' + i).disabled = true;
   });
-  console.warn('[PartChecker] Camera permission error:', errorName);
 }
 
-/**
- * Hide the permission banner and retry camera for step 1.
- */
 async function retryCameraPermission() {
   document.getElementById('camPermBanner').classList.remove('visible');
   [1, 2, 3].forEach(i => {
@@ -1395,54 +1377,57 @@ async function retryCameraPermission() {
 
 async function startCamera(n) {
   const video = document.getElementById('video' + n);
+
+  // Clear any previous stream
+  if (state.streams[n]) {
+    state.streams[n].getTracks().forEach(t => t.stop());
+    delete state.streams[n];
+  }
   video.srcObject = null;
 
-  // Check permission state first — gives a clear error instead of silent failure
-  const perm = await checkCameraPermission();
-  console.log('[PartChecker] Camera permission state:', perm);
-
-  if (perm === 'denied') {
-    showPermissionError('denied');
+  // Check if getUserMedia is available at all
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    console.error('[PartChecker] getUserMedia not available — not HTTPS?');
+    setOcr(n, '⚠ Camera API unavailable — must be served over HTTPS', 'fail');
+    document.getElementById('camPermBanner').classList.add('visible');
     return;
   }
 
-  try {
-    if (state.streams[n]) {
-      state.streams[n].getTracks().forEach(t => t.stop());
-      delete state.streams[n];
-    }
+  console.log('[PartChecker] Calling getUserMedia for step', n);
 
+  try {
     const stream = await navigator.mediaDevices.getUserMedia({
       video: {
-        facingMode: 'environment',
-        aspectRatio: { ideal: 4/3 },
+        facingMode: { ideal: 'environment' },
         width:  { ideal: 1280 },
         height: { ideal: 960 }
       },
       audio: false
     });
 
-    // Got permission — hide any previous permission error
-    document.getElementById('camPermBanner').classList.remove('visible');
+    console.log('[PartChecker] Camera stream obtained, tracks:',
+      stream.getVideoTracks().map(t => t.label).join(', '));
 
+    document.getElementById('camPermBanner').classList.remove('visible');
     state.streams[n] = stream;
     video.srcObject  = stream;
     video.style.display = 'block';
     document.getElementById('preview' + n).style.display = 'none';
-    video.play().catch(() => {});
+    await video.play().catch(e => console.warn('[PartChecker] video.play():', e.message));
 
   } catch (e) {
-    console.warn('[PartChecker] getUserMedia error:', e.name, e.message);
-    // NotAllowedError = user denied or system blocked
-    // NotFoundError   = no camera hardware
+    console.error('[PartChecker] getUserMedia failed:', e.name, '—', e.message);
     if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') {
       showPermissionError(e.name);
     } else if (e.name === 'NotFoundError' || e.name === 'DevicesNotFoundError') {
-      setOcr(n, '⚠ No camera found on this device — enter values manually', 'fail');
+      setOcr(n, '⚠ No camera found — enter values manually', 'fail');
+      document.getElementById('manual'     + n).style.display = 'flex';
+      document.getElementById('captureBtn' + n).style.display = 'none';
+    } else if (e.name === 'NotReadableError') {
+      setOcr(n, '⚠ Camera in use by another app — close it and retry', 'fail');
       document.getElementById('manual'     + n).style.display = 'flex';
       document.getElementById('captureBtn' + n).style.display = 'none';
     } else {
-      // Other error (NotReadableError = camera in use by another app, etc.)
       setOcr(n, `⚠ Camera error: ${e.name} — enter value manually`, 'fail');
       document.getElementById('manual'     + n).style.display = 'flex';
       document.getElementById('captureBtn' + n).style.display = 'none';
