@@ -437,6 +437,39 @@
     .debug-img-wrap img { width: 100%; border: 1px solid #222; border-radius: 2px; display: block; }
 
     canvas.hidden { display: none; }
+
+    /* ── DIAGNOSTIC PANEL ────────────────────────────────────────────────
+       Real-time log shown at the bottom of the page.
+       Each log() call prepends a timestamped line.                      */
+    #diagPanel {
+      position: fixed; bottom: 0; left: 0; right: 0; z-index: 9999;
+      background: rgba(0,0,0,0.93); border-top: 1px solid #333;
+      font-family: var(--mono); font-size: 0.68rem;
+      max-height: 40vh; display: flex; flex-direction: column;
+    }
+    #diagHeader {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 6px 12px; background: #111; border-bottom: 1px solid #222;
+      cursor: pointer; user-select: none; flex-shrink: 0;
+    }
+    #diagHeader span { color: var(--accent); letter-spacing: 0.1em; text-transform: uppercase; font-size: 0.65rem; }
+    #diagHeader button {
+      background: transparent; border: 1px solid #444; color: #888;
+      font-family: var(--mono); font-size: 0.65rem; padding: 2px 8px;
+      cursor: pointer; border-radius: 2px;
+    }
+    #diagLog {
+      overflow-y: auto; padding: 6px 10px; flex: 1;
+    }
+    #diagLog .dl { padding: 2px 0; border-bottom: 1px solid #111; line-height: 1.4; }
+    #diagLog .dl .ts  { color: #444; margin-right: 6px; }
+    #diagLog .dl.info { color: #aaa; }
+    #diagLog .dl.ok   { color: var(--ok); }
+    #diagLog .dl.warn { color: var(--warn); }
+    #diagLog .dl.err  { color: var(--nok); }
+    #diagLog .dl.step { color: var(--accent); }
+    #diagCollapsed #diagLog { display: none; }
+    #diagCollapsed #diagHeader { border-bottom: none; }
   </style>
 
 </head>
@@ -628,6 +661,20 @@
 
 <canvas class="hidden" id="captureCanvas"></canvas>
 
+<!-- ═══ REAL-TIME DIAGNOSTIC PANEL ══════════════════════════════════════
+     Tap the header to collapse/expand. Shows every step in real time.  -->
+
+<div id="diagPanel">
+  <div id="diagHeader" onclick="diagToggle()">
+    <span>🔬 Diagnostics</span>
+    <div style="display:flex;gap:6px">
+      <button onclick="event.stopPropagation();diagClear()">Clear</button>
+      <button onclick="event.stopPropagation();diagToggle()" id="diagToggleBtn">▼ Hide</button>
+    </div>
+  </div>
+  <div id="diagLog"><div class="dl info"><span class="ts">--:--:--</span>Diagnostic panel ready</div></div>
+</div>
+
 <!-- JSZip: ZIP packaging for download -->
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
@@ -812,7 +859,7 @@ async function initTesseract() {
       // Show progress in console so we can confirm it is alive
       logger: m => {
         if (m.status === 'recognizing text') {
-          console.log('[Tesseract] recognizing…', Math.round((m.progress || 0) * 100) + '%');
+          diag('step', '[Tesseract] recognizing…', Math.round((m.progress || 0) * 100) + '%');
         }
       }
     });
@@ -820,10 +867,10 @@ async function initTesseract() {
     state.tessReady   = true;
     state.tessLoading = false;
     setEngineBanner('ready', '✓ Tesseract OCR ready');
-    console.log('[PartChecker] Tesseract worker ready');
+    diag('info', '[PartChecker] Tesseract worker ready');
   } catch (e) {
     state.tessLoading = false;
-    console.error('[PartChecker] Tesseract init error:', e);
+    diag('err', '[PartChecker] Tesseract init error:', e);
     setEngineBanner('error', `✗ OCR failed to load (${e.message})`);
   }
 }
@@ -845,17 +892,17 @@ async function runTesseract(pngDataUrl, stepNum) {
 
   const psm = stepNum === 3 ? 6 : 7;
 
-  console.log('[PartChecker] recognize() start — PSM:', psm,
+  diag('info', '[PartChecker] recognize() start — PSM:', psm,
               'image bytes:', pngDataUrl.length, 'step:', stepNum);
   try {
     const { data } = await state.tessWorker.recognize(pngDataUrl, {},
       { tessedit_pageseg_mode: psm }
     );
-    console.log('[PartChecker] recognize() done — text:', JSON.stringify(data.text),
+    diag('info', '[PartChecker] recognize() done — text:', JSON.stringify(data.text),
                 'confidence:', data.confidence);
     return data.text.trim().toUpperCase() || null;
   } catch (e) {
-    console.error('[PartChecker] recognize() error:', e);
+    diag('err', '[PartChecker] recognize() error:', e);
     return null;
   }
 }
@@ -1357,7 +1404,7 @@ document.addEventListener('DOMContentLoaded', () => {
  * Returns 'granted' | 'denied' | 'prompt' | 'unknown'
  */
 function showPermissionError(errorName) {
-  console.warn('[PartChecker] Camera permission error:', errorName);
+  diag('warn', '[PartChecker] Camera permission error:', errorName);
   document.getElementById('camPermBanner').classList.add('visible');
   [1, 2, 3].forEach(i => {
     setOcr(i, '⚠ Camera permission denied — see instructions above', 'fail');
@@ -1376,6 +1423,7 @@ async function retryCameraPermission() {
 }
 
 async function startCamera(n) {
+  diag('step', `startCamera(${n}) called`);
   const video = document.getElementById('video' + n);
 
   // Clear any previous stream
@@ -1387,13 +1435,13 @@ async function startCamera(n) {
 
   // Check if getUserMedia is available at all
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    console.error('[PartChecker] getUserMedia not available — not HTTPS?');
+    diag('err', '[PartChecker] getUserMedia not available — not HTTPS?');
     setOcr(n, '⚠ Camera API unavailable — must be served over HTTPS', 'fail');
     document.getElementById('camPermBanner').classList.add('visible');
     return;
   }
 
-  console.log('[PartChecker] Calling getUserMedia for step', n);
+  diag('info', '[PartChecker] Calling getUserMedia for step', n);
 
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -1405,7 +1453,7 @@ async function startCamera(n) {
       audio: false
     });
 
-    console.log('[PartChecker] Camera stream obtained, tracks:',
+    diag('info', '[PartChecker] Camera stream obtained, tracks:',
       stream.getVideoTracks().map(t => t.label).join(', '));
 
     document.getElementById('camPermBanner').classList.remove('visible');
@@ -1413,10 +1461,10 @@ async function startCamera(n) {
     video.srcObject  = stream;
     video.style.display = 'block';
     document.getElementById('preview' + n).style.display = 'none';
-    await video.play().catch(e => console.warn('[PartChecker] video.play():', e.message));
+    await video.play().catch(e => diag('warn', '[PartChecker] video.play():', e.message));
 
   } catch (e) {
-    console.error('[PartChecker] getUserMedia failed:', e.name, '—', e.message);
+    diag('err', '[PartChecker] getUserMedia failed:', e.name, '—', e.message);
     if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') {
       showPermissionError(e.name);
     } else if (e.name === 'NotFoundError' || e.name === 'DevicesNotFoundError') {
@@ -1635,6 +1683,7 @@ function zmCancel() {
  *   5. Update UI — advance on success, show manual entry + debug on failure
  */
 async function captureStep(n) {
+  diag('step', `captureStep(${n}) called`);
   const video   = document.getElementById('video'      + n);
   const preview = document.getElementById('preview'    + n);
   const btn     = document.getElementById('captureBtn' + n);
@@ -1665,7 +1714,7 @@ async function captureStep(n) {
     // object-fit:cover mapping. After stopCamera() these return 0.
     const videoDisplayW = video.clientWidth;
     const videoDisplayH = video.clientHeight;
-    console.log('[PartChecker] Snapshot:', canvas.width, '×', canvas.height,
+    diag('info', '[PartChecker] Snapshot:', canvas.width, '×', canvas.height,
                 '| video display:', videoDisplayW, '×', videoDisplayH);
 
     // ── Freeze preview ────────────────────────────────────────────────────
@@ -1713,7 +1762,7 @@ async function captureStep(n) {
       canvas.height = croppedCanvas.height;
       canvas.getContext('2d').drawImage(croppedCanvas, 0, 0);
       alreadyCropped = true;
-      console.log('[PartChecker] Zoom selection:', canvas.width, '×', canvas.height);
+      diag('info', '[PartChecker] Zoom selection:', canvas.width, '×', canvas.height);
     }
 
     // ── Preprocess ────────────────────────────────────────────────────────
@@ -1721,9 +1770,9 @@ async function captureStep(n) {
     try {
       const result = preprocessImage(canvas, videoProxy, n, alreadyCropped);
       pngDataUrl = result.pngDataUrl;
-      console.log('[PartChecker] Preprocessed PNG length:', pngDataUrl.length);
+      diag('info', '[PartChecker] Preprocessed PNG length:', pngDataUrl.length);
     } catch (prepErr) {
-      console.error('[PartChecker] Preprocessing failed:', prepErr);
+      diag('err', '[PartChecker] Preprocessing failed:', prepErr);
       throw prepErr;
     }
 
@@ -1737,24 +1786,24 @@ async function captureStep(n) {
         const results = await new BarcodeDetector().detect(canvas);
         if (results.length > 0) {
           value = results[0].rawValue.toUpperCase().replace(/[^A-Z0-9]/g, '');
-          console.log('[PartChecker] Barcode detected:', value);
+          diag('info', '[PartChecker] Barcode detected:', value);
         }
-      } catch(e) { console.warn('[PartChecker] BarcodeDetector:', e); }
+      } catch(e) { diag('warn', '[PartChecker] BarcodeDetector:', e); }
       if (value) { finishStep(n, value, 'Native BarcodeDetector'); return; }
     }
 
     // ── Tesseract ─────────────────────────────────────────────────────────
-    console.log('[PartChecker] → Tesseract ready:', state.tessReady,
+    diag('info', '[PartChecker] → Tesseract ready:', state.tessReady,
                 'worker:', !!state.tessWorker, 'step:', n);
     const rawText = await runTesseract(pngDataUrl, n);
-    console.log('[PartChecker] ← Tesseract result:', JSON.stringify(rawText));
+    diag('info', '[PartChecker] ← Tesseract result:', JSON.stringify(rawText));
 
     if (rawText) {
       if (n === 2 && rawText.replace(/\s/g, '').length > 25) {
-        console.warn('[PartChecker] Metal result too long, rejecting noise');
+        diag('warn', '[PartChecker] Metal result too long, rejecting noise');
       } else {
         value = n === 2 ? extractMetalPN(rawText) : extractPaperPN(rawText);
-        console.log('[PartChecker] Extracted:', value);
+        diag('info', '[PartChecker] Extracted:', value);
       }
     }
 
@@ -1773,7 +1822,7 @@ async function captureStep(n) {
 
   } catch (err) {
     // Catch-all — surfaces any silent error that was causing the stall
-    console.error('[PartChecker] captureStep error:', err);
+    diag('err', '[PartChecker] captureStep error:', err);
     setOcr(n, `⚠ Error: ${err.message} — enter manually`, 'fail');
     document.getElementById('manual' + n).style.display = 'flex';
     preview.style.display = 'none';
@@ -2045,22 +2094,66 @@ function setOcr(n, html, cls = '') {
 
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  DIAGNOSTIC PANEL
+// ═══════════════════════════════════════════════════════════════════════════
+
+function diagToggle() {
+  const p = document.getElementById('diagPanel');
+  const btn = document.getElementById('diagToggleBtn');
+  const log = document.getElementById('diagLog');
+  const collapsed = log.style.display === 'none';
+  log.style.display = collapsed ? 'block' : 'none';
+  btn.textContent   = collapsed ? '▼ Hide' : '▶ Show';
+}
+
+function diagClear() {
+  document.getElementById('diagLog').innerHTML = '';
+}
+
+/**
+ * Write a line to the on-screen diagnostic panel.
+ * Also calls the real console method so DevTools still works.
+ * @param {'info'|'ok'|'warn'|'err'|'step'} level
+ * @param {...any} args
+ */
+function diag(level, ...args) {
+  const msg = args.map(a =>
+    (typeof a === 'object') ? JSON.stringify(a) : String(a)
+  ).join(' ');
+
+  // Real console
+  if (level === 'err')  console.error(msg);
+  else if (level === 'warn') console.warn(msg);
+  else                  console.log(msg);
+
+  // On-screen panel
+  const log = document.getElementById('diagLog');
+  if (!log) return;
+  const now = new Date();
+  const ts  = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}:${String(now.getSeconds()).padStart(2,'0')}`;
+  const el  = document.createElement('div');
+  el.className = `dl ${level}`;
+  el.innerHTML = `<span class="ts">${ts}</span>${msg}`;
+  log.insertBefore(el, log.firstChild); // newest at top
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  INIT
 // ═══════════════════════════════════════════════════════════════════════════
 window.addEventListener('load', () => {
-  // Diagnostic: log Tesseract global so we can confirm the script loaded
-  // and inspect the available API before initTesseract() runs.
+  diag('info', 'Page loaded');
+  diag('info', `HTTPS: ${location.protocol === 'https:' ? 'YES ✓' : 'NO ✗ — camera requires HTTPS'}`);
+  diag('info', `mediaDevices: ${!!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) ? 'available ✓' : 'NOT available ✗'}`);
+
   if (typeof Tesseract !== 'undefined') {
-    console.log('[PartChecker] Tesseract loaded, version:', Tesseract.version || '(unknown)');
-    console.log('[PartChecker] Tesseract API keys:', Object.keys(Tesseract).join(', '));
+    diag('ok', `Tesseract loaded — version: ${Tesseract.version || 'unknown'}`);
   } else {
-    console.error('[PartChecker] Tesseract is NOT defined — script failed to load');
+    diag('err', 'Tesseract NOT defined — CDN script failed to load');
   }
 
   startCamera(1);
-  // Pre-warm Tesseract in background (downloads ~10 MB eng.traineddata once,
-  // then cached by service worker for offline use)
   initTesseract();
+
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('./sw.js').catch(() => {});
   }
