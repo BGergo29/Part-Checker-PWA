@@ -654,24 +654,43 @@ function sanitizeMetalInput(el) {
 
 /**
  * Extract a metal part number from raw OCR text.
- * Looks for pattern: 4 chars + separator + 5–6 chars + separator + 2 chars.
- * OCR often misreads '-' as '/' or '.' so we accept all four as separators.
- * Returns the value with separators stripped (for comparison with paper/barcode).
  *
- * Relaxed fallback: if no pattern match, return whatever alphanumeric chars
- * Tesseract found (length 8–13) so the user can verify and correct manually.
+ * Expected format (from real part): "HY32 16151 AB"
+ *   Group 1: 2–4 alphanumeric chars
+ *   Separator: space, dash, slash, or dot (OCR misreads separators)
+ *   Group 2: 4–6 alphanumeric chars
+ *   Separator: same
+ *   Group 3: 2 alphanumeric chars
+ *
+ * Returns the value WITHOUT separators so it can be compared to
+ * the paper label and barcode (which also have no separators).
+ *
+ * We try patterns from most to least strict, stopping at first match.
+ * The raw text is shown to the user so they can correct OCR errors.
  */
 function extractMetalPN(raw) {
-  const s = raw.toUpperCase();
-  // Try strict pattern first
-  const rx = /[A-Z0-9]{4}[\s\-\/\.][A-Z0-9]{5,6}[\s\-\/\.][A-Z0-9]{2}/;
-  const m  = s.match(rx);
-  if (m) return stripSeparators(m[0]);
-  // Relaxed: strip all non-alphanumeric, return if plausible length
+  // Clean: uppercase, collapse whitespace, remove control chars
+  const s = raw.toUpperCase().replace(/[
+	]+/g, ' ').trim();
+
+  // Pattern 1: strict — matches "HY32 16151 AB" and similar
+  // Groups: 2-4 chars + sep + 4-6 chars + sep + 2 chars
+  const strict = s.match(/([A-Z0-9]{2,4})[\s\-\/\.]([A-Z0-9]{4,6})[\s\-\/\.]([A-Z0-9]{2})/);
+  if (strict) return strict[1] + strict[2] + strict[3];
+
+  // Pattern 2: looser — 4-char groups with any single separator char
+  const loose = s.match(/([A-Z0-9]{4})[\s\-\/\.]([A-Z0-9]{5,6})[\s\-\/\.]([A-Z0-9]{2})/);
+  if (loose) return loose[1] + loose[2] + loose[3];
+
+  // Pattern 3: just strip everything non-alphanumeric — works if OCR
+  // read the characters correctly but mangled the separators
   const bare = s.replace(/[^A-Z0-9]/g, '');
-  if (bare.length >= 8 && bare.length <= 14) return bare;
-  // Last resort: return whatever was found, trimmed
-  return bare.length > 0 ? bare : null;
+  // Accept 8–12 chars (covers 2+4+2=8 to 4+6+2=12)
+  if (bare.length >= 8 && bare.length <= 12) return bare;
+
+  // No match — return null so user is prompted to enter manually
+  // (better than returning garbage like "CTCANEOEURNAEREEEE20TR...")
+  return null;
 }
 
 /**
@@ -810,9 +829,11 @@ async function runTesseract(pngDataUrl, stepNum) {
 
   // PSM per step:
   //   1 (paper)   = 7 SINGLE_LINE  — one clean printed line
-  //   2 (metal)   = 6 SINGLE_BLOCK — multi-group engraved number
+  //   2 (metal)   = 7 SINGLE_LINE  — stamped number is ONE line: "HY32 16151 AB"
+  //                  PSM 6 (block) was causing Tesseract to invent characters
+  //                  from surface noise on imaginary "other lines"
   //   3 (barcode) = 6 SINGLE_BLOCK — label with mixed content
-  const psm = { 1: '7', 2: '6', 3: '6' }[stepNum] || '7';
+  const psm = { 1: '7', 2: '7', 3: '6' }[stepNum] || '7';
 
   try {
     console.log('[PartChecker] runTesseract PSM:', psm, '— image length:', pngDataUrl.length);
@@ -1125,6 +1146,38 @@ function applyLocalContrast(canvas, tiles = 4) {
 }
 
 /**
+ * Simple 3×3 box blur to suppress isolated noise pixels.
+ * Each pixel becomes the average of itself and its 8 neighbours.
+ * This reduces single-pixel "salt and pepper" noise that Tesseract
+ * reads as punctuation characters.
+ * Only applied to greyscale (R=G=B) images.
+ * @param {HTMLCanvasElement} canvas - modified in-place
+ */
+function applyDeNoise(canvas) {
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  const src = ctx.getImageData(0, 0, W, H);
+  const dst = ctx.createImageData(W, H);
+  const s = src.data, d = dst.data;
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const i = (y * W + x) * 4;
+      // Average 3×3 neighbourhood
+      let sum = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          sum += s[((y + dy) * W + (x + dx)) * 4];
+        }
+      }
+      const v = Math.round(sum / 9);
+      d[i] = d[i+1] = d[i+2] = v;
+      d[i+3] = 255;
+    }
+  }
+  ctx.putImageData(dst, 0, 0);
+}
+
+/**
  * Full preprocessing pipeline — tuned per step type.
  *
  * PAPER (step 1):   greyscale → global contrast → sharpen → PNG
@@ -1145,52 +1198,46 @@ function preprocessImage(fullCanvas, video, stepNum) {
   const cropped = cropToViewfinder(fullCanvas, video, stepNum);
 
   if (stepNum === 2) {
-    // ── METAL: aggressive pipeline ─────────────────────────────────────
-    // Engraved/stamped text has very low contrast against the metal surface.
-    // We need to maximise the difference between the groove and the surface.
+    // ── METAL: conservative pipeline for manual-cropped stamp ─────────────
+    //
+    // The user has already manually selected just the stamped characters in
+    // the zoom editor.  This means:
+    //   • We do NOT need aggressive noise-amplifying techniques
+    //   • Otsu threshold HURTS here — on a low-contrast stamp it turns metal
+    //     surface grain into fake black blobs that Tesseract reads as letters
+    //   • CLAHE with many tiles also amplifies grain in areas with no text
+    //
+    // Strategy: gentle processing to clean up the crop, then send to
+    // Tesseract as a greyscale image (not binarised).  Tesseract's internal
+    // binarisation handles greyscale better than our pre-binarisation when
+    // contrast is very low.
 
-    // a. Convert to greyscale
+    // a. Greyscale
     applyGreyscale(cropped);
 
-    // b. Upscale 2× — small engraved characters need to be larger for Tesseract
-    //    Tesseract accuracy drops sharply below ~30px character height.
+    // b. Upscale 3× — stamped characters are often very small.
+    //    Tesseract needs characters to be at least 20–30px tall.
     const up = document.createElement('canvas');
-    up.width  = cropped.width  * 2;
-    up.height = cropped.height * 2;
+    up.width  = cropped.width  * 3;
+    up.height = cropped.height * 3;
     const upCtx = up.getContext('2d');
     upCtx.imageSmoothingEnabled = true;
     upCtx.imageSmoothingQuality = 'high';
     upCtx.drawImage(cropped, 0, 0, up.width, up.height);
 
-    // c. Local contrast enhancement (CLAHE-style, 4×4 tiles)
-    //    Handles uneven lighting across the metal surface
-    applyLocalContrast(up, 4);
+    // c. Gentle global contrast stretch (NOT CLAHE — too few tiles amplify grain)
+    applyContrast(up);
 
-    // d. Sharpen twice — engraved edges need strong sharpening
-    applySharpen(up);
+    // d. Single sharpen pass — crisp edges without amplifying surface noise
     applySharpen(up);
 
-    // e. Otsu threshold → pure black/white
-    //    Try both polarities and pick the one with more white area
-    //    (Tesseract prefers dark text on white background)
-    const upCopy = document.createElement('canvas');
-    upCopy.width = up.width; upCopy.height = up.height;
-    upCopy.getContext('2d').drawImage(up, 0, 0);
+    // e. Apply a gentle median-like blur using a 3×3 box blur to suppress
+    //    isolated noise pixels that Tesseract would read as punctuation
+    applyDeNoise(up);
 
-    applyOtsuThreshold(up, false);        // dark text on white
-    applyOtsuThreshold(upCopy, true);     // white text on black (inverted)
-
-    // Count white pixels to determine which polarity has more background
-    const normalCtx = up.getContext('2d');
-    const normalData = normalCtx.getImageData(0, 0, up.width, up.height).data;
-    let whiteCount = 0;
-    for (let i = 0; i < normalData.length; i += 4) if (normalData[i] === 255) whiteCount++;
-    const whiteRatio = whiteCount / (up.width * up.height);
-
-    // If less than 40% white, the image is mostly dark — use inverted version
-    // (Tesseract works best with dark text on light/white background)
-    const finalCanvas = whiteRatio >= 0.40 ? up : upCopy;
-    const pngDataUrl = finalCanvas.toDataURL('image/png');
+    // f. Send as greyscale PNG — let Tesseract do its own binarisation
+    //    internally, which is better calibrated than ours for marginal contrast
+    const pngDataUrl = up.toDataURL('image/png');
     return { pngDataUrl };
 
   } else if (stepNum === 1) {
@@ -1635,8 +1682,16 @@ async function captureStep(n) {
   console.log('[PartChecker] Tesseract raw result:', JSON.stringify(rawText));
 
   if (rawText) {
-    value = n === 2 ? extractMetalPN(rawText) : extractPaperPN(rawText);
-    console.log('[PartChecker] Extracted value:', value, '(step', n, ')');
+    // Sanity check for metal: if Tesseract returned a very long string
+    // (>25 chars) it has read noise as characters — reject it immediately
+    // rather than trying to extract a pattern from garbage.
+    if (n === 2 && rawText.replace(/\s/g,'').length > 25) {
+      console.warn('[PartChecker] Metal OCR output too long — likely noise, rejecting:', rawText.length, 'chars');
+      // rawText set to null so we fall through to manual entry
+    } else {
+      value = n === 2 ? extractMetalPN(rawText) : extractPaperPN(rawText);
+      console.log('[PartChecker] Extracted value:', value, '(step', n, ')');
+    }
   }
 
   if (value) {
