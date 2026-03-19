@@ -847,31 +847,58 @@ async function initTesseract() {
 
   state.tessLoading = true;
   setEngineBanner('loading', '⏳ Loading OCR engine…');
+  diag('info', 'initTesseract: starting');
 
   const BASE = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.0/dist';
 
-  try {
-    state.tessWorker = await Tesseract.createWorker('eng', 1, {
-      workerPath : `${BASE}/worker.min.js`,
-      corePath   : `${BASE}/tesseract-core-simd-lstm.wasm.js`,
-      langPath   : 'https://tessdata.projectnaptha.com/4.0.0_best',
-      // Show progress in console so we can confirm it is alive
-      logger: m => {
-        if (m.status === 'recognizing text') {
-          diag('step', '[Tesseract] recognizing…', Math.round((m.progress || 0) * 100) + '%');
-        }
-      }
-    });
+  // Language data sources — tried in order until one succeeds.
+  // tessdata.projectnaptha.com is the canonical source but unreliable.
+  // jsDelivr and unpkg both mirror the same tessdata files.
+  const langPaths = [
+    'https://cdn.jsdelivr.net/npm/tesseract.js-data@4.0.0/eng/4.0.0_best',
+    'https://unpkg.com/tesseract.js-data@4.0.0/eng/4.0.0_best',
+    'https://tessdata.projectnaptha.com/4.0.0_best',
+    'https://cdn.jsdelivr.net/npm/tesseract.js-data@4.0.0/eng/4.0.0',
+  ];
 
-    state.tessReady   = true;
-    state.tessLoading = false;
-    setEngineBanner('ready', '✓ Tesseract OCR ready');
-    diag('info', '[PartChecker] Tesseract worker ready');
-  } catch (e) {
-    state.tessLoading = false;
-    diag('err', '[PartChecker] Tesseract init error:', e);
-    setEngineBanner('error', `✗ OCR failed to load (${e.message})`);
+  const logger = m => {
+    if (m.status) {
+      diag('step', `[Tesseract] ${m.status} ${m.progress != null ? Math.round(m.progress * 100) + '%' : ''}`);
+    }
+  };
+
+  for (const langPath of langPaths) {
+    try {
+      diag('info', `Trying langPath: ${langPath.split('/').slice(-3).join('/')}`);
+      setEngineBanner('loading', `⏳ Loading language data…`);
+
+      state.tessWorker = await Tesseract.createWorker('eng', 1, {
+        workerPath : `${BASE}/worker.min.js`,
+        corePath   : `${BASE}/tesseract-core-simd-lstm.wasm.js`,
+        langPath,
+        logger
+      });
+
+      state.tessReady   = true;
+      state.tessLoading = false;
+      setEngineBanner('ready', '✓ Tesseract OCR ready');
+      diag('ok', `Tesseract ready — langPath: ${langPath.split('/').slice(-3).join('/')}`);
+      return; // success — stop trying
+
+    } catch (e) {
+      diag('warn', `langPath failed (${e.message}) — trying next…`);
+      // Terminate the failed worker if it was partially created
+      if (state.tessWorker) {
+        try { await state.tessWorker.terminate(); } catch (_) {}
+        state.tessWorker = null;
+      }
+    }
   }
+
+  // All sources failed
+  state.tessLoading = false;
+  diag('err', 'All Tesseract langPath sources failed — manual entry only');
+  setEngineBanner('error', '✗ OCR language data failed to load — use manual entry');
 }
 
 /**
