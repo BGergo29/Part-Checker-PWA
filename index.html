@@ -1053,8 +1053,10 @@ async function captureStep(n) {
   const camWrap = document.getElementById('cam'        + n + 'wrap');
   const canvas  = document.getElementById('captureCanvas');
 
+  // Guard: if camera isn't live yet (e.g. button clicked too quickly after
+  // a retake), show a message and bail — the camera will be ready shortly.
   if (!video.srcObject) {
-    document.getElementById('manual' + n).style.display = 'flex';
+    setOcr(n, '⏳ Camera starting — please wait a moment then try again', 'thinking');
     return;
   }
 
@@ -1122,12 +1124,25 @@ async function captureStep(n) {
   if (value) {
     finishStep(n, value, 'Tesseract OCR');
   } else {
-    // Failed — always show debug image so user can see what Tesseract received
-    setOcr(n, `⚠ Could not read — check debug image below or enter manually`, 'fail');
+    // ── OCR failed ────────────────────────────────────────────────────────
+    // Show the debug crop so the user can judge framing/lighting,
+    // show manual entry, AND restart the live camera so Re-capture works.
+    setOcr(n, `⚠ Could not read — adjust framing and re-capture, or enter manually`, 'fail');
+    showDebugImage(pngDataUrl, n);
+
+    // Show manual entry as fallback
     document.getElementById('manual' + n).style.display = 'flex';
+
+    // Reset the frozen preview so the live feed shows again
+    preview.style.display = 'none';
+    video.style.display   = 'block';
+
+    // Restart camera so the Re-capture button finds a live stream
+    await startCamera(n);
+
+    // Re-enable the capture button with a clear label
     btn.textContent = '📷 Re-capture';
     btn.disabled    = false;
-    showDebugImage(pngDataUrl, n);  // auto-show on failure even without debug mode
   }
 }
 
@@ -1225,18 +1240,23 @@ function enableStep(n) {
   startCamera(n);
 }
 
-function retakeStep(n) {
+async function retakeStep(n) {
   state.values[n] = null;
   state.images[n] = null;
+
   const pd = document.getElementById('partDisplay' + n);
   pd.textContent = '— — — — — — — — — —'; pd.className = 'part-display empty';
+
   document.getElementById('badge'       + n).textContent = 'Pending';
   document.getElementById('badge'       + n).className   = 'badge badge-pending';
   document.getElementById('retake'      + n).style.display = 'none';
+
+  // Reset capture button — disable briefly while camera starts, then enable
   const btn = document.getElementById('captureBtn' + n);
-  btn.style.display = 'block'; btn.disabled = false;
-  btn.textContent = n === 3 ? '📷 Capture Barcode'
-    : ('📷 Capture ' + (n === 1 ? 'Paper Label' : 'Metal Surface'));
+  btn.style.display = 'block';
+  btn.disabled      = true;           // re-enabled once camera is live
+  btn.textContent   = '⏳ Starting camera…';
+
   document.getElementById('preview'    + n).style.display = 'none';
   document.getElementById('video'      + n).style.display = 'block';
   document.getElementById('thumb'      + n).classList.remove('visible');
@@ -1244,8 +1264,8 @@ function retakeStep(n) {
   document.getElementById('d'          + n).className = 'dot active';
   document.getElementById('manualInput'+ n).value = '';
   document.getElementById('manual'     + n).style.display = 'none';
-  setOcr(n, n === 3 ? 'Point camera — barcode inside the box'
-                    : 'Point camera — part number inside the box');
+  setOcr(n, 'Starting camera…', 'thinking');
+
   // Hide result section
   document.getElementById('statusBanner').className = 'status-banner';
   document.getElementById('compareCard').style.display = 'none';
@@ -1253,7 +1273,15 @@ function retakeStep(n) {
   document.getElementById('dlBtn').classList.remove('visible');
   document.getElementById('savedInfo').textContent = '';
   delete finalise._ran;
-  startCamera(n);
+
+  // Await camera start before enabling the button
+  await startCamera(n);
+
+  btn.textContent = n === 3 ? '📷 Capture Barcode'
+    : ('📷 Capture ' + (n === 1 ? 'Paper Label' : 'Metal Surface'));
+  btn.disabled = false;
+  setOcr(n, n === 3 ? 'Point camera — barcode inside the box'
+                    : 'Point camera — part number inside the box');
 }
 
 
