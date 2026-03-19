@@ -103,6 +103,30 @@
     #engineBanner.error   { background: rgba(255,45,85,0.07); color: var(--nok);
                             border-bottom: 1px solid rgba(255,45,85,0.2); display: block; }
 
+    /* ── CAMERA PERMISSION BANNER ────────────────────────────────────────
+       Shown when camera access is denied or unavailable.               */
+    #camPermBanner {
+      display: none; padding: 16px 20px;
+      background: rgba(255,45,85,0.08);
+      border-bottom: 1px solid rgba(255,45,85,0.3);
+      font-family: var(--mono); font-size: 0.75rem; color: var(--nok);
+      line-height: 1.6;
+    }
+    #camPermBanner.visible { display: block; }
+    #camPermBanner strong  { color: #ff6680; }
+    #camPermBanner .perm-steps {
+      margin-top: 8px; padding-left: 12px;
+      color: var(--text); font-size: 0.7rem; list-style: none;
+    }
+    #camPermBanner .perm-steps li::before { content: "→ "; color: var(--nok); }
+    #camPermBanner .perm-retry {
+      margin-top: 10px; padding: 8px 16px;
+      background: transparent; border: 1px solid var(--nok); color: var(--nok);
+      font-family: var(--sans); font-weight: 700; font-size: 0.85rem;
+      letter-spacing: 0.1em; text-transform: uppercase;
+      cursor: pointer; border-radius: 2px;
+    }
+
     /* ── STEP PROGRESS DOTS ────────────────────────────────────────────── */
     .step-indicator { display: flex; gap: 6px; align-items: center; }
     .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); transition: all 0.3s; }
@@ -433,6 +457,23 @@
 <!-- Tesseract loading / ready / error status bar -->
 
 <div id="engineBanner" class="loading">⏳ Loading Tesseract OCR engine…</div>
+
+<!-- Camera permission error banner -->
+
+<div id="camPermBanner">
+  <strong>📷 Camera access required</strong><br>
+  The browser has not granted camera permission. To fix this:
+  <ul class="perm-steps">
+    <li>Tap the <strong>lock / camera icon</strong> in your browser address bar</li>
+    <li>Set Camera to <strong>Allow</strong></li>
+    <li>Reload the page</li>
+  </ul>
+  <div style="margin-top:6px;font-size:0.68rem;color:var(--muted)">
+    On iOS: Settings → Safari → Camera → Allow<br>
+    On Android Chrome: Settings → Site Settings → Camera → Allow
+  </div>
+  <button class="perm-retry" onclick="retryCameraPermission()">↺ Retry Camera</button>
+</div>
 
 <!-- ═══ MAIN ══════════════════════════════════════════════════════════════ -->
 
@@ -1311,16 +1352,61 @@ document.addEventListener('DOMContentLoaded', () => {
  * We request 4:3 natively to avoid the cover-crop problem where possible,
  * but fall back gracefully if the device only supports 16:9.
  */
+/**
+ * Check camera permission state before attempting getUserMedia.
+ * Returns 'granted' | 'denied' | 'prompt' | 'unknown'
+ */
+async function checkCameraPermission() {
+  if (!navigator.permissions) return 'unknown';
+  try {
+    const result = await navigator.permissions.query({ name: 'camera' });
+    return result.state; // 'granted' | 'denied' | 'prompt'
+  } catch (e) {
+    return 'unknown';
+  }
+}
+
+/**
+ * Show the camera permission error banner with instructions.
+ */
+function showPermissionError(errorName) {
+  const banner = document.getElementById('camPermBanner');
+  banner.classList.add('visible');
+  // Also update each step's OCR row
+  [1, 2, 3].forEach(i => {
+    setOcr(i, '⚠ Camera permission denied — see instructions above', 'fail');
+    document.getElementById('captureBtn' + i).disabled = true;
+  });
+  console.warn('[PartChecker] Camera permission error:', errorName);
+}
+
+/**
+ * Hide the permission banner and retry camera for step 1.
+ */
+async function retryCameraPermission() {
+  document.getElementById('camPermBanner').classList.remove('visible');
+  [1, 2, 3].forEach(i => {
+    document.getElementById('captureBtn' + i).disabled = (i !== 1);
+    setOcr(i, i === 1 ? 'Point camera — part number inside the box'
+                      : i === 2 ? 'Complete step 1 first' : 'Complete steps 1 & 2 first');
+  });
+  await startCamera(1);
+}
+
 async function startCamera(n) {
   const video = document.getElementById('video' + n);
-
-  // BLACK SCREEN FIX: null out srcObject before assigning a new stream.
-  // If a previous stream was stopped but srcObject still points to it,
-  // some browsers show a black frame instead of the new stream.
   video.srcObject = null;
 
+  // Check permission state first — gives a clear error instead of silent failure
+  const perm = await checkCameraPermission();
+  console.log('[PartChecker] Camera permission state:', perm);
+
+  if (perm === 'denied') {
+    showPermissionError('denied');
+    return;
+  }
+
   try {
-    // Stop any lingering tracks from the previous stream
     if (state.streams[n]) {
       state.streams[n].getTracks().forEach(t => t.stop());
       delete state.streams[n];
@@ -1329,8 +1415,6 @@ async function startCamera(n) {
     const stream = await navigator.mediaDevices.getUserMedia({
       video: {
         facingMode: 'environment',
-        // Prefer 4:3 so the native frame matches the CSS box — removes
-        // the object-fit:cover coordinate mismatch on devices that support it.
         aspectRatio: { ideal: 4/3 },
         width:  { ideal: 1280 },
         height: { ideal: 960 }
@@ -1338,20 +1422,31 @@ async function startCamera(n) {
       audio: false
     });
 
+    // Got permission — hide any previous permission error
+    document.getElementById('camPermBanner').classList.remove('visible');
+
     state.streams[n] = stream;
     video.srcObject  = stream;
     video.style.display = 'block';
     document.getElementById('preview' + n).style.display = 'none';
-
-    // Explicitly call play() — required on some mobile browsers after
-    // srcObject is set programmatically (avoids "not allowed to play" stall)
     video.play().catch(() => {});
 
   } catch (e) {
-    console.warn('Camera error:', e);
-    setOcr(n, '⚠ Camera unavailable — enter value manually', 'fail');
-    document.getElementById('manual'     + n).style.display = 'flex';
-    document.getElementById('captureBtn' + n).style.display = 'none';
+    console.warn('[PartChecker] getUserMedia error:', e.name, e.message);
+    // NotAllowedError = user denied or system blocked
+    // NotFoundError   = no camera hardware
+    if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') {
+      showPermissionError(e.name);
+    } else if (e.name === 'NotFoundError' || e.name === 'DevicesNotFoundError') {
+      setOcr(n, '⚠ No camera found on this device — enter values manually', 'fail');
+      document.getElementById('manual'     + n).style.display = 'flex';
+      document.getElementById('captureBtn' + n).style.display = 'none';
+    } else {
+      // Other error (NotReadableError = camera in use by another app, etc.)
+      setOcr(n, `⚠ Camera error: ${e.name} — enter value manually`, 'fail');
+      document.getElementById('manual'     + n).style.display = 'flex';
+      document.getElementById('captureBtn' + n).style.display = 'none';
+    }
   }
 }
 
