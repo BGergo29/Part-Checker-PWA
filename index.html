@@ -1193,9 +1193,17 @@ function applyDeNoise(canvas) {
  * @param {number}            stepNum
  * @returns {{ pngDataUrl: string }}
  */
-function preprocessImage(fullCanvas, video, stepNum) {
-  // 1. Crop to viewfinder zone with object-fit:cover correction
-  const cropped = cropToViewfinder(fullCanvas, video, stepNum);
+/**
+ * @param {HTMLCanvasElement} fullCanvas
+ * @param {HTMLVideoElement|null} video  - null when canvas is already cropped
+ * @param {number} stepNum
+ * @param {boolean} alreadyCropped      - true = skip cropToViewfinder
+ */
+function preprocessImage(fullCanvas, video, stepNum, alreadyCropped = false) {
+  // 1. Crop to viewfinder zone (skip if caller already cropped the canvas)
+  const cropped = alreadyCropped
+    ? fullCanvas
+    : cropToViewfinder(fullCanvas, video, stepNum);
 
   if (stepNum === 2) {
     // ── METAL: conservative pipeline for manual-cropped stamp ─────────────
@@ -1581,8 +1589,6 @@ async function captureStep(n) {
   const camWrap = document.getElementById('cam'        + n + 'wrap');
   const canvas  = document.getElementById('captureCanvas');
 
-  // Guard: if camera isn't live yet (e.g. button clicked too quickly after
-  // a retake), show a message and bail — the camera will be ready shortly.
   if (!video.srcObject) {
     setOcr(n, '⏳ Camera starting — please wait a moment then try again', 'thinking');
     return;
@@ -1592,119 +1598,136 @@ async function captureStep(n) {
   btn.textContent = '⏳ Processing…';
   camWrap.classList.add('scanning');
 
-  // ── Full-resolution snapshot ───────────────────────────────────────────
-  // Use track settings for the true hardware resolution — more reliable
-  // than video.videoWidth which can reflect the CSS display size on some browsers.
-  const track    = video.srcObject?.getVideoTracks()[0];
-  const settings = track ? track.getSettings() : {};
-  canvas.width   = settings.width  || video.videoWidth  || 1280;
-  canvas.height  = settings.height || video.videoHeight || 960;
-  canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+  try {
 
-  // Keep the original colour image for the ZIP
-  const originalDataUrl = canvas.toDataURL('image/jpeg', 0.95);
+    // ── Snapshot ─────────────────────────────────────────────────────────
+    const track    = video.srcObject?.getVideoTracks()[0];
+    const settings = track ? track.getSettings() : {};
+    canvas.width   = settings.width  || video.videoWidth  || 1280;
+    canvas.height  = settings.height || video.videoHeight || 960;
+    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+    const originalDataUrl = canvas.toDataURL('image/jpeg', 0.95);
 
-  // ── Preprocess (yield first so scan animation renders) ─────────────────
-  setOcr(n, `<span class="spinner"></span>&nbsp;Preprocessing image…`, 'thinking');
-  await new Promise(r => setTimeout(r, 15));
+    // ── Capture video display dimensions NOW before stopping camera ───────
+    // cropToViewfinder needs video.clientWidth/Height to compute the
+    // object-fit:cover mapping. After stopCamera() these return 0.
+    const videoDisplayW = video.clientWidth;
+    const videoDisplayH = video.clientHeight;
+    console.log('[PartChecker] Snapshot:', canvas.width, '×', canvas.height,
+                '| video display:', videoDisplayW, '×', videoDisplayH);
 
-  // ── Freeze preview with original colour photo ──────────────────────────
-  const pctx = preview.getContext('2d');
-  preview.width = canvas.width; preview.height = canvas.height;
-  pctx.drawImage(canvas, 0, 0);
-  preview.style.display = 'block';
-  video.style.display   = 'none';
-  camWrap.classList.remove('scanning');
-  stopCamera(n);
+    // ── Freeze preview ────────────────────────────────────────────────────
+    setOcr(n, `<span class="spinner"></span>&nbsp;Preprocessing…`, 'thinking');
+    await new Promise(r => setTimeout(r, 15));
+    const pctx = preview.getContext('2d');
+    preview.width = canvas.width; preview.height = canvas.height;
+    pctx.drawImage(canvas, 0, 0);
+    preview.style.display = 'block';
+    video.style.display   = 'none';
+    camWrap.classList.remove('scanning');
+    stopCamera(n);
 
-  if (!state.firstTimestamp && n === 1) state.firstTimestamp = new Date();
+    if (!state.firstTimestamp && n === 1) state.firstTimestamp = new Date();
 
-  // Store original + show thumbnail
-  state.images[n] = originalDataUrl;
-  document.getElementById('thumb' + n).src = originalDataUrl;
-  document.getElementById('thumb' + n).classList.add('visible');
-  document.getElementById('thumbStrip').style.display = 'flex';
+    state.images[n] = originalDataUrl;
+    document.getElementById('thumb' + n).src = originalDataUrl;
+    document.getElementById('thumb' + n).classList.add('visible');
+    document.getElementById('thumbStrip').style.display = 'flex';
 
-  // ── Step 2 (metal): open zoom editor before OCR ────────────────────────
-  // For stamped/engraved text the user must manually select the exact
-  // region containing the number.  The zoom modal returns a cropped
-  // canvas that replaces the full-frame canvas for OCR processing.
-  if (n === 2) {
-    setOcr(n, '✂ Select the number in the editor above…', 'thinking');
-    // openZoomEditor resolves with a canvas cropped to the user's selection,
-    // or null if they cancelled (re-capture).
-    const croppedCanvas = await openZoomEditor(canvas);
-    if (!croppedCanvas) {
-      // User cancelled — restart camera for re-capture
+    // ── Step 2: zoom editor ───────────────────────────────────────────────
+    // User selects the stamped number region manually.
+    // We pass a fake video-like object with the saved display dimensions
+    // so cropToViewfinder still works if called (it won't be for step 2
+    // after zoom, but we keep the object for safety).
+    const videoProxy = { clientWidth: videoDisplayW, clientHeight: videoDisplayH };
+
+    let alreadyCropped = false;
+
+    if (n === 2) {
+      setOcr(n, '✂ Select the number in the editor…', 'thinking');
+      const croppedCanvas = await openZoomEditor(canvas);
+      if (!croppedCanvas) {
+        // User cancelled — restart camera
+        preview.style.display = 'none';
+        video.style.display   = 'block';
+        await startCamera(n);
+        btn.textContent = '📷 Capture Metal Surface';
+        btn.disabled    = false;
+        setOcr(n, 'Point camera — part number inside the box');
+        return;
+      }
+      // Use the user's selection directly — no further cropping needed
+      canvas.width  = croppedCanvas.width;
+      canvas.height = croppedCanvas.height;
+      canvas.getContext('2d').drawImage(croppedCanvas, 0, 0);
+      alreadyCropped = true;
+      console.log('[PartChecker] Zoom selection:', canvas.width, '×', canvas.height);
+    }
+
+    // ── Preprocess ────────────────────────────────────────────────────────
+    let pngDataUrl;
+    try {
+      const result = preprocessImage(canvas, videoProxy, n, alreadyCropped);
+      pngDataUrl = result.pngDataUrl;
+      console.log('[PartChecker] Preprocessed PNG length:', pngDataUrl.length);
+    } catch (prepErr) {
+      console.error('[PartChecker] Preprocessing failed:', prepErr);
+      throw prepErr;
+    }
+
+    if (state.debugMode) showDebugImage(pngDataUrl, n);
+    setOcr(n, `<span class="spinner"></span>&nbsp;Reading with Tesseract OCR…`, 'thinking');
+
+    // ── Barcode (step 3) ──────────────────────────────────────────────────
+    let value = null;
+    if (n === 3 && 'BarcodeDetector' in window) {
+      try {
+        const results = await new BarcodeDetector().detect(canvas);
+        if (results.length > 0) {
+          value = results[0].rawValue.toUpperCase().replace(/[^A-Z0-9]/g, '');
+          console.log('[PartChecker] Barcode detected:', value);
+        }
+      } catch(e) { console.warn('[PartChecker] BarcodeDetector:', e); }
+      if (value) { finishStep(n, value, 'Native BarcodeDetector'); return; }
+    }
+
+    // ── Tesseract ─────────────────────────────────────────────────────────
+    console.log('[PartChecker] → Tesseract ready:', state.tessReady,
+                'worker:', !!state.tessWorker, 'step:', n);
+    const rawText = await runTesseract(pngDataUrl, n);
+    console.log('[PartChecker] ← Tesseract result:', JSON.stringify(rawText));
+
+    if (rawText) {
+      if (n === 2 && rawText.replace(/\s/g, '').length > 25) {
+        console.warn('[PartChecker] Metal result too long, rejecting noise');
+      } else {
+        value = n === 2 ? extractMetalPN(rawText) : extractPaperPN(rawText);
+        console.log('[PartChecker] Extracted:', value);
+      }
+    }
+
+    if (value) {
+      finishStep(n, value, 'Tesseract OCR');
+    } else {
+      setOcr(n, `⚠ Could not read — enter manually below`, 'fail');
+      showDebugImage(pngDataUrl, n);
+      document.getElementById('manual' + n).style.display = 'flex';
       preview.style.display = 'none';
       video.style.display   = 'block';
       await startCamera(n);
-      btn.textContent = '📷 Capture Metal Surface';
+      btn.textContent = n === 2 ? '📷 Re-capture Metal' : '📷 Re-capture';
       btn.disabled    = false;
-      setOcr(n, 'Point camera — part number inside the box');
-      return;
     }
-    // Replace canvas content with the user's selection for preprocessing
-    canvas.width  = croppedCanvas.width;
-    canvas.height = croppedCanvas.height;
-    canvas.getContext('2d').drawImage(croppedCanvas, 0, 0);
-  }
 
-  // ── Preprocess and run OCR ─────────────────────────────────────────────
-  const { pngDataUrl } = preprocessImage(canvas, video, n);
-
-  // Show debug image if debug mode is on
-  if (state.debugMode) showDebugImage(pngDataUrl, n);
-
-  setOcr(n, `<span class="spinner"></span>&nbsp;Reading with Tesseract OCR…`, 'thinking');
-
-  let value = null;
-
-  // Step 3: BarcodeDetector on the snapshot canvas
-  if (n === 3) {
-    if ('BarcodeDetector' in window) {
-      try {
-        const bd = new BarcodeDetector();
-        const results = await bd.detect(canvas);
-        if (results.length > 0) {
-          value = results[0].rawValue.toUpperCase().replace(/[^A-Z0-9]/g, '');
-          console.log('[PartChecker] Native barcode result:', value);
-        }
-      } catch(e) { console.warn('[PartChecker] BarcodeDetector error:', e); }
-    }
-    if (value) { finishStep(n, value, 'Native BarcodeDetector'); return; }
-  }
-
-  console.log('[PartChecker] Sending to Tesseract — length:', pngDataUrl.length);
-  console.log('[PartChecker] Tesseract ready:', state.tessReady, 'worker:', !!state.tessWorker);
-
-  const rawText = await runTesseract(pngDataUrl, n);
-  console.log('[PartChecker] Tesseract raw result:', JSON.stringify(rawText));
-
-  if (rawText) {
-    // Sanity check for metal: if Tesseract returned a very long string
-    // (>25 chars) it has read noise as characters — reject it immediately
-    // rather than trying to extract a pattern from garbage.
-    if (n === 2 && rawText.replace(/\s/g,'').length > 25) {
-      console.warn('[PartChecker] Metal OCR output too long — likely noise, rejecting:', rawText.length, 'chars');
-      // rawText set to null so we fall through to manual entry
-    } else {
-      value = n === 2 ? extractMetalPN(rawText) : extractPaperPN(rawText);
-      console.log('[PartChecker] Extracted value:', value, '(step', n, ')');
-    }
-  }
-
-  if (value) {
-    finishStep(n, value, 'Tesseract OCR');
-  } else {
-    console.warn('[PartChecker] No value extracted. rawText:', JSON.stringify(rawText));
-    setOcr(n, `⚠ Could not read — enter manually below`, 'fail');
-    showDebugImage(pngDataUrl, n);
+  } catch (err) {
+    // Catch-all — surfaces any silent error that was causing the stall
+    console.error('[PartChecker] captureStep error:', err);
+    setOcr(n, `⚠ Error: ${err.message} — enter manually`, 'fail');
     document.getElementById('manual' + n).style.display = 'flex';
     preview.style.display = 'none';
     video.style.display   = 'block';
     await startCamera(n);
-    btn.textContent = n === 2 ? '📷 Re-capture Metal' : '📷 Re-capture';
+    btn.textContent = '📷 Re-capture';
     btn.disabled    = false;
   }
 }
