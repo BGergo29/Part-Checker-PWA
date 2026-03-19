@@ -831,104 +831,106 @@ function setEngineBanner(cls, text) {
 }
 
 /**
- * Initialise Tesseract.js v5.
+ * Initialise Tesseract.js v5 using the simple high-level API.
  *
- * IMPORTANT: Do NOT call setParameters() during or after init in v5.
- * Setting tessedit_char_whitelist via setParameters causes Tesseract v5
- * to hang indefinitely on the next recognize() call.
- * PSM is passed directly in the recognize() call options instead.
+ * Instead of createWorker() (which requires fetching language data from
+ * an external URL that keeps failing), we use Tesseract.recognize() which
+ * handles everything internally using the paths baked into the CDN build.
+ *
+ * We run a dummy recognition on a tiny blank canvas at startup to:
+ *   1. Trigger the worker + language data download while the user is
+ *      still setting up (pre-warm)
+ *   2. Confirm the engine actually works before the first real scan
+ *
+ * For real scans, runTesseract() calls Tesseract.recognize() directly —
+ * no persistent worker to manage.
  */
 async function initTesseract() {
   if (state.tessReady || state.tessLoading) return;
   if (typeof Tesseract === 'undefined') {
-    setEngineBanner('error', '✗ Tesseract library failed to load — check network');
+    setEngineBanner('error', '✗ Tesseract script not loaded');
+    diag('err', 'Tesseract global is undefined');
     return;
   }
 
   state.tessLoading = true;
   setEngineBanner('loading', '⏳ Loading OCR engine…');
-  diag('info', 'initTesseract: starting');
+  diag('info', 'initTesseract: using high-level Tesseract.recognize() API');
 
-  const BASE = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.0/dist';
+  try {
+    // Create a tiny 100×30 white canvas with a black letter — enough to
+    // trigger the full download + init without bothering the user
+    const warm = document.createElement('canvas');
+    warm.width = 100; warm.height = 30;
+    const ctx = warm.getContext('2d');
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, 100, 30);
+    ctx.fillStyle = '#000'; ctx.font = '20px monospace';
+    ctx.fillText('A', 10, 22);
 
-  // Language data sources — tried in order until one succeeds.
-  // tessdata.projectnaptha.com is the canonical source but unreliable.
-  // jsDelivr and unpkg both mirror the same tessdata files.
-  const langPaths = [
-    'https://cdn.jsdelivr.net/npm/tesseract.js-data@4.0.0/eng/4.0.0_best',
-    'https://unpkg.com/tesseract.js-data@4.0.0/eng/4.0.0_best',
-    'https://tessdata.projectnaptha.com/4.0.0_best',
-    'https://cdn.jsdelivr.net/npm/tesseract.js-data@4.0.0/eng/4.0.0',
-  ];
+    diag('info', 'Pre-warming Tesseract (first load may take ~10s)…');
+    setEngineBanner('loading', '⏳ Downloading OCR language data (~10 MB)…');
 
-  const logger = m => {
-    if (m.status) {
-      diag('step', `[Tesseract] ${m.status} ${m.progress != null ? Math.round(m.progress * 100) + '%' : ''}`);
-    }
-  };
-
-  for (const langPath of langPaths) {
-    try {
-      diag('info', `Trying langPath: ${langPath.split('/').slice(-3).join('/')}`);
-      setEngineBanner('loading', `⏳ Loading language data…`);
-
-      state.tessWorker = await Tesseract.createWorker('eng', 1, {
-        workerPath : `${BASE}/worker.min.js`,
-        corePath   : `${BASE}/tesseract-core-simd-lstm.wasm.js`,
-        langPath,
-        logger
-      });
-
-      state.tessReady   = true;
-      state.tessLoading = false;
-      setEngineBanner('ready', '✓ Tesseract OCR ready');
-      diag('ok', `Tesseract ready — langPath: ${langPath.split('/').slice(-3).join('/')}`);
-      return; // success — stop trying
-
-    } catch (e) {
-      diag('warn', `langPath failed (${e.message}) — trying next…`);
-      // Terminate the failed worker if it was partially created
-      if (state.tessWorker) {
-        try { await state.tessWorker.terminate(); } catch (_) {}
-        state.tessWorker = null;
+    await Tesseract.recognize(warm, 'eng', {
+      logger: m => {
+        if (m.status) {
+          const pct = m.progress != null ? ' ' + Math.round(m.progress * 100) + '%' : '';
+          diag('step', `[Tesseract] ${m.status}${pct}`);
+          setEngineBanner('loading', `⏳ ${m.status}${pct}`);
+        }
       }
-    }
-  }
+    });
 
-  // All sources failed
-  state.tessLoading = false;
-  diag('err', 'All Tesseract langPath sources failed — manual entry only');
-  setEngineBanner('error', '✗ OCR language data failed to load — use manual entry');
+    state.tessReady   = true;
+    state.tessLoading = false;
+    setEngineBanner('ready', '✓ Tesseract OCR ready');
+    diag('ok', 'Tesseract pre-warm complete — ready to scan');
+
+  } catch (e) {
+    state.tessLoading = false;
+    const msg = (e && e.message) ? e.message : JSON.stringify(e);
+    diag('err', 'Tesseract init failed:', msg);
+    setEngineBanner('error', `✗ OCR failed to load — use manual entry`);
+  }
 }
 
 /**
- * Run Tesseract OCR on a PNG data-URL.
- * PSM is passed directly in the recognize() options — NOT via setParameters.
- * setParameters with char_whitelist causes Tesseract v5 to hang.
- *
- * PSM values:
- *   7 = single text line  (paper + metal)
- *   6 = single text block (barcode)
+ * Run Tesseract OCR on a PNG data-URL using the high-level API.
+ * Tesseract.recognize() is stateless — each call is independent.
+ * PSM is passed in the options object.
  */
 async function runTesseract(pngDataUrl, stepNum) {
   if (!state.tessReady) {
+    // Try to init if not done yet (e.g. user scanned before pre-warm finished)
     await initTesseract();
-    if (!state.tessReady) return null;
+    if (!state.tessReady) {
+      diag('err', 'runTesseract: Tesseract not ready, cannot recognise');
+      return null;
+    }
   }
 
   const psm = stepNum === 3 ? 6 : 7;
 
-  diag('info', '[PartChecker] recognize() start — PSM:', psm,
-              'image bytes:', pngDataUrl.length, 'step:', stepNum);
+  diag('info', `recognize() start — PSM:${psm} step:${stepNum} bytes:${pngDataUrl.length}`);
+
   try {
-    const { data } = await state.tessWorker.recognize(pngDataUrl, {},
-      { tessedit_pageseg_mode: psm }
-    );
-    diag('info', '[PartChecker] recognize() done — text:', JSON.stringify(data.text),
-                'confidence:', data.confidence);
-    return data.text.trim().toUpperCase() || null;
+    const result = await Tesseract.recognize(pngDataUrl, 'eng', {
+      logger: m => {
+        if (m.status === 'recognizing text') {
+          diag('step', `[Tesseract] recognizing ${Math.round((m.progress||0)*100)}%`);
+        }
+      }
+    }, {
+      tessedit_pageseg_mode: psm
+    });
+
+    const text = result.data.text;
+    const conf = result.data.confidence;
+    diag('ok', `recognize() done — confidence:${conf} text:${JSON.stringify(text)}`);
+    return text.trim().toUpperCase() || null;
+
   } catch (e) {
-    diag('err', '[PartChecker] recognize() error:', e);
+    const msg = (e && e.message) ? e.message : JSON.stringify(e);
+    diag('err', 'recognize() error:', msg);
     return null;
   }
 }
