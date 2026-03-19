@@ -611,6 +611,12 @@ function setEngineBanner(cls, text) {
  * Create the Tesseract worker and load the English language model.
  * Called once at page load (pre-warms the worker so first scan is fast).
  * The worker is kept alive in state.tessWorker for reuse.
+ *
+ * ROOT CAUSE OF "failed to load":
+ *   Tesseract 4.x createWorker() tries to auto-detect paths to its worker JS
+ *   and WASM files using document.currentScript — this fails when loaded from
+ *   a CDN <script> tag in a plain HTML file (no module bundler).
+ *   We pass explicit CDN URLs so Tesseract can always find its files.
  */
 async function initTesseract() {
   if (state.tessReady || state.tessLoading) return;
@@ -622,20 +628,26 @@ async function initTesseract() {
   state.tessLoading = true;
   setEngineBanner('loading', '⏳ Loading OCR engine and language data…');
 
+  // Explicit CDN paths — required when Tesseract is loaded via a plain <script>
+  // tag rather than a module bundler (auto-detection fails otherwise).
+  const CDN = 'https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/4.1.2';
+  const workerOptions = {
+    workerPath: `${CDN}/worker.min.js`,
+    corePath:   `${CDN}/tesseract-core.wasm.js`,
+    langPath:   'https://tessdata.projectnaptha.com/4.0.0',
+    logger:     () => {}   // silence progress logs
+  };
+
   try {
     // OEM 1 = LSTM neural-net mode (most accurate for mixed alpha-numeric)
-    state.tessWorker = await Tesseract.createWorker('eng', 1, {
-      logger: () => {} // suppress progress logs
-    });
+    state.tessWorker = await Tesseract.createWorker('eng', 1, workerOptions);
 
     // Character whitelist: only what our part numbers can contain.
-    // Narrowing this down is the single most effective tuning for accuracy —
-    // Tesseract will never guess a character outside this set.
     await state.tessWorker.setParameters({
       tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -'
     });
 
-    state.tessReady  = true;
+    state.tessReady   = true;
     state.tessLoading = false;
     setEngineBanner('ready', '✓ Tesseract OCR ready (offline)');
   } catch (e) {
@@ -962,25 +974,40 @@ document.addEventListener('DOMContentLoaded', () => {
  */
 async function startCamera(n) {
   const video = document.getElementById('video' + n);
+
+  // BLACK SCREEN FIX: null out srcObject before assigning a new stream.
+  // If a previous stream was stopped but srcObject still points to it,
+  // some browsers show a black frame instead of the new stream.
+  video.srcObject = null;
+
   try {
-    if (state.streams[n]) state.streams[n].getTracks().forEach(t => t.stop());
+    // Stop any lingering tracks from the previous stream
+    if (state.streams[n]) {
+      state.streams[n].getTracks().forEach(t => t.stop());
+      delete state.streams[n];
+    }
 
     const stream = await navigator.mediaDevices.getUserMedia({
       video: {
         facingMode: 'environment',
-        // Prefer 4:3 so native frame matches the CSS box — eliminates
-        // the cover-crop mismatch for devices that support it.
-        // Most modern phones will honour this or get close.
+        // Prefer 4:3 so the native frame matches the CSS box — removes
+        // the object-fit:cover coordinate mismatch on devices that support it.
         aspectRatio: { ideal: 4/3 },
         width:  { ideal: 1280 },
         height: { ideal: 960 }
       },
       audio: false
     });
+
     state.streams[n] = stream;
     video.srcObject  = stream;
     video.style.display = 'block';
     document.getElementById('preview' + n).style.display = 'none';
+
+    // Explicitly call play() — required on some mobile browsers after
+    // srcObject is set programmatically (avoids "not allowed to play" stall)
+    video.play().catch(() => {});
+
   } catch (e) {
     console.warn('Camera error:', e);
     setOcr(n, '⚠ Camera unavailable — enter value manually', 'fail');
@@ -989,12 +1016,20 @@ async function startCamera(n) {
   }
 }
 
-/** Stop and release a camera stream. */
+/**
+ * Stop and release a camera stream.
+ * Nulling srcObject is essential — some browsers (especially iOS Safari)
+ * keep the camera LED on and the stream "open" unless srcObject is cleared.
+ * It also prevents the black-screen issue on the next startCamera() call.
+ */
 function stopCamera(n) {
+  const video = document.getElementById('video' + n);
   if (state.streams[n]) {
     state.streams[n].getTracks().forEach(t => t.stop());
     delete state.streams[n];
   }
+  // Clear srcObject so the next startCamera() gets a clean slate
+  if (video) video.srcObject = null;
 }
 
 
