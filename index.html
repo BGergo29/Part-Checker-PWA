@@ -493,9 +493,9 @@
 
 <!-- Tesseract.js: in-browser OCR (WASM + English language data) -->
 
-<!-- Tesseract.js v2 — specifically built for direct <script> tag use, no bundler needed -->
+<!-- Tesseract.js v5 — UMD build works as a plain <script> tag -->
 
-<script src="https://unpkg.com/tesseract.js@2.1.5/dist/tesseract.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.0/dist/tesseract.min.js"></script>
 
 <script>
 // ═══════════════════════════════════════════════════════════════════════════
@@ -610,23 +610,18 @@ function setEngineBanner(cls, text) {
 }
 
 /**
- * Initialise a Tesseract.js v2 worker.
+ * Initialise Tesseract.js v5.
  *
- * WHY v2 INSTEAD OF v4?
- *   Tesseract v4+ requires a module bundler (Webpack/Vite) to resolve its
- *   internal worker and WASM paths.  When loaded from a plain <script> tag
- *   the auto-detection always fails.  Tesseract v2 was specifically designed
- *   for direct browser <script> use and exposes explicit path options that
- *   work reliably without a bundler.
+ * v5 is the first version with a proper UMD browser build that loads
+ * correctly from a plain <script> tag without a module bundler.
  *
- * v2 INIT SEQUENCE (different from v4):
- *   createWorker(options)   → create worker process
- *   worker.loadLanguage()   → fetch eng.traineddata from langPath CDN
- *   worker.initialize()     → load the language into the WASM engine
- *   worker.setParameters()  → configure whitelist, PSM, etc.
+ * v5 API changes from v2:
+ *   createWorker(lang, oem, options)  — language passed directly, no
+ *   separate loadLanguage/initialize calls needed.
+ *   The worker is ready to recognise immediately after createWorker resolves.
  *
- * All files (worker JS, WASM, language data) are fetched once from CDN
- * and then cached by the service worker for offline use.
+ * All WASM and language files are auto-resolved from jsDelivr CDN and
+ * cached by the service worker for offline use after first load.
  */
 async function initTesseract() {
   if (state.tessReady || state.tessLoading) return;
@@ -638,24 +633,22 @@ async function initTesseract() {
   state.tessLoading = true;
   setEngineBanner('loading', '⏳ Loading OCR engine and language data…');
 
+  // All three paths must point to the SAME version on the SAME CDN.
+  // jsDelivr hosts all Tesseract assets and is highly reliable globally.
+  const BASE = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.0/dist';
+  const LANG = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.0/src/lang';
+
   try {
-    // v2 createWorker — all paths explicit so it works from a <script> tag
-    state.tessWorker = await Tesseract.createWorker({
-      workerPath: 'https://unpkg.com/tesseract.js@2.1.5/dist/worker.min.js',
-      langPath:   'https://tessdata.projectnaptha.com/4.0.0',
-      corePath:   'https://unpkg.com/tesseract.js-core@2.2.0/tesseract-core.wasm.js',
-      logger:     () => {}   // silence verbose progress events
+    state.tessWorker = await Tesseract.createWorker('eng', 1, {
+      // Explicit paths so Tesseract can find its files from a CDN <script> tag
+      workerPath : `${BASE}/worker.min.js`,
+      corePath   : `${BASE}/tesseract-core-simd-lstm.wasm.js`,
+      langPath   : 'https://tessdata.projectnaptha.com/4.0.0_best',
+      logger     : () => {}
     });
 
-    // v2 requires explicit loadLanguage + initialize steps
-    await state.tessWorker.loadLanguage('eng');
-    await state.tessWorker.initialize('eng');
-
-    // Character whitelist — only characters that appear in our part numbers.
-    // This is the most effective single tuning for reducing mis-reads.
     await state.tessWorker.setParameters({
-      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -',
-      tessedit_pageseg_mode:   Tesseract.PSM.SINGLE_LINE   // default; overridden per call
+      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -'
     });
 
     state.tessReady   = true;
@@ -664,21 +657,35 @@ async function initTesseract() {
   } catch (e) {
     state.tessLoading = false;
     console.error('Tesseract init failed:', e);
-    setEngineBanner('error', `✗ OCR failed to load (${e.message}) — use manual entry`);
+    // Try fallback: no explicit paths, let Tesseract guess (works on some hosts)
+    setEngineBanner('loading', '⏳ Retrying OCR engine load…');
+    try {
+      state.tessWorker = await Tesseract.createWorker('eng', 1, { logger: () => {} });
+      await state.tessWorker.setParameters({
+        tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -'
+      });
+      state.tessReady   = true;
+      state.tessLoading = false;
+      setEngineBanner('ready', '✓ Tesseract OCR ready');
+    } catch (e2) {
+      state.tessLoading = false;
+      console.error('Tesseract fallback also failed:', e2);
+      setEngineBanner('error', `✗ OCR failed (${e2.message}) — use manual entry`);
+    }
   }
 }
 
 /**
- * Run Tesseract on a PNG data-URL with a step-specific PSM setting.
+ * Run Tesseract OCR on a preprocessed PNG image.
  *
- * PSM (Page Segmentation Mode) tells Tesseract how to interpret the layout:
- *   7 = treat the entire image as a SINGLE TEXT LINE (best for a clean label)
- *   8 = treat the entire image as a SINGLE WORD (stamped metal with tight chars)
- *   6 = assume a single uniform block of text (barcodes / mixed content)
+ * PSM (Page Segmentation Mode) is tuned per step:
+ *   '7' = SINGLE_LINE  — paper label (one clean printed line)
+ *   '8' = SINGLE_WORD  — metal stamp (tight block of chars)
+ *   '6' = SINGLE_BLOCK — barcode text label
  *
- * @param {string} pngDataUrl - preprocessed PNG image (full data-URL)
- * @param {number} stepNum    - drives PSM selection
- * @returns {Promise<string|null>} raw OCR text, or null on failure
+ * @param {string} pngDataUrl - preprocessed PNG (full data-URL)
+ * @param {number} stepNum    - 1=paper, 2=metal, 3=barcode
+ * @returns {Promise<string|null>} raw OCR text or null
  */
 async function runTesseract(pngDataUrl, stepNum) {
   if (!state.tessReady) {
@@ -686,11 +693,6 @@ async function runTesseract(pngDataUrl, stepNum) {
     if (!state.tessReady) return null;
   }
 
-  // PSM (Page Segmentation Mode) — controls how Tesseract segments the image.
-  // We use numeric string values which work in both v2 and v4:
-  //   '7' = SINGLE_LINE  — paper label (one clean text line)
-  //   '8' = SINGLE_WORD  — metal stamp (compact block of characters)
-  //   '6' = SINGLE_BLOCK — barcode text (uniform block)
   const psm = { 1: '7', 2: '8', 3: '6' }[stepNum] || '7';
 
   try {
@@ -1424,6 +1426,15 @@ function setOcr(n, html, cls = '') {
 //  INIT
 // ═══════════════════════════════════════════════════════════════════════════
 window.addEventListener('load', () => {
+  // Diagnostic: log Tesseract global so we can confirm the script loaded
+  // and inspect the available API before initTesseract() runs.
+  if (typeof Tesseract !== 'undefined') {
+    console.log('[PartChecker] Tesseract loaded, version:', Tesseract.version || '(unknown)');
+    console.log('[PartChecker] Tesseract API keys:', Object.keys(Tesseract).join(', '));
+  } else {
+    console.error('[PartChecker] Tesseract is NOT defined — script failed to load');
+  }
+
   startCamera(1);
   // Pre-warm Tesseract in background (downloads ~10 MB eng.traineddata once,
   // then cached by service worker for offline use)
